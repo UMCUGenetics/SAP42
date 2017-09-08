@@ -1,0 +1,44 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+my $projectLocation;
+my $scriptRoot;
+my $pathSubstitute;
+
+$| = 1;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+}
+
+use Getopt::Long;
+require config;
+
+my $configurationFile = shift(@ARGV) or die "Supply a configurationfile\n\n";
+
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+foreach my $configuration (@{$configurations}){
+
+	my $working_directory = $configuration->{PWD};
+	my $projectname = $configuration->{NAME};
+	
+	my $GENOME = $configuration->{REFERENCE};
+	my $arguments = $configuration->{ALNARG};
+
+	chdir($working_directory);
+}

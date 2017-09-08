@@ -1,0 +1,418 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Long;
+use IO::File;
+
+#########################################################
+#	pileupper script to replace samtools pileup	#
+#	Frans Paul Ruzius / Ies Nijman			#
+#	v1.01 - dd 02-07-2010				
+#							
+#	last changes:
+#	- fixed bug with call information
+#	- outputfile is optional, not defined is stdout
+
+#	@TODO:	1) bam readin form multiple BAMS
+#		2) option: only print variable calls
+
+#
+#########################################################
+
+# ======================================================
+# Getting and checking options
+# ======================================================
+
+my $usage = "./SAP42_pileup -ref <Fasta reference> (required) -bam <BAM> (required) -region <chr|chr:start|chr:start-end> (optional) -out <output.pileup> (optional) -onlyvar\n";
+
+my %opt = (
+	'help' => 0, 
+	'ref' => undef,               	# OBLIGATORY: reference file
+	'out' => undef,             	# OPTIONAL: output file
+	'bam' => undef,			# OBLIGATORY: bam file
+	'region' => undef,		# OPTIONAL: region chr or chr:start-end
+);	
+
+GetOptions ('help|h|?' => \$opt{help}, 	"bam=s" 	=> \$opt{'bam'},
+					"out=s" 	=> \$opt{'out'}, 
+					"ref=s" 	=> \$opt{'ref'}, 
+					"region=s" 	=> \$opt{'region'},
+					"onlyvar" 	=> \$opt{'noref'},
+					 ) || die "ERROR: Illegal arguments or parameters: @ARGV\n";
+die "$usage\n" if $opt{help};
+die "$usage\n" unless $opt{ref};
+die "$usage\n" unless $opt{bam};
+# die "$usage\n" unless $opt{out};
+
+my $referenceFile = $opt{ref};
+
+my $outputFile = '';
+
+if ($opt{'out'}){
+	$outputFile = $opt{'out'};
+}else{
+	$outputFile = 0;
+	$opt{out} = '';
+}
+
+my $bam = $opt{'bam'};
+my $region = defined($opt{'region'}) ? $opt{'region'} : '';
+
+die "reference file $referenceFile does not exist\n" unless -e $referenceFile;
+# die "bam file $bam does not exist\n" unless -e $bam;
+if ($region) {
+    die "region $region not correctly formatted chr:start-end\n" unless ( $region =~ /\w+:?\d{0,}\-?\d{0,}/);
+}
+
+if ($outputFile){
+	open OUT, ">" . $outputFile or die "cannot open out file: $!\n";
+	warn "Output is send to " . $outputFile . "\n\n";
+}else{
+	warn "Output is send to standard-out\n\n";
+}
+
+my ($currentPosition, $next_chromosome, $current_chromosome) = (0,'','');
+my @referenceArray;
+my $positions = {};
+################################################################## CHECKS DONE: PROCEED ###############################
+# check first fasta header
+
+open (REF, "<$referenceFile") or die "cannot open ref $referenceFile: $!\n";
+$current_chromosome = <REF>;
+chomp $current_chromosome;
+$current_chromosome =~ s/\s.+$//;
+$current_chromosome =~ s/>//;
+
+
+while (<REF>){
+	chomp;
+	if ($_ !~ m/>/){
+		push(@referenceArray, $_);
+	}else{
+		$next_chromosome = $1 if ($_ =~ />(\w+)\s*/);
+		last;
+	}
+
+}
+
+my $reference = join("", @referenceArray);
+my $referenceLenght = length($reference);
+
+warn "Loaded first chromosome $current_chromosome\n";
+warn "Length " . $referenceLenght . "\n\n";
+
+# start going trough the BAM file by converting to SAM and running through the lines
+
+
+my $fhs = open_bams($region, split(',',$bam));
+
+while (scalar(@$fhs)) {
+
+	my ($strand, $flag, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits) = (undef, undef,undef,undef,undef,undef,undef,undef,undef);
+
+	($fhs, $strand, $flag, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits) = next_sam_line($fhs);
+	
+	next if $flag == 4; #read is unmapped, skip
+	($flag == 0) ? ($strand = 1) : ($strand = 0); #determine strand of mapped read
+	
+	if ($chrom eq "$current_chromosome"){
+	    print_pileup($cord, $chrom);
+	}else{
+		print_pileup(); # print remainder
+		$positions = {};
+		$reference = next_reference_sequence($chrom);
+		$referenceLenght = length($reference);
+		warn "Loaded chromosome $current_chromosome\n";
+		warn "Length " . $referenceLenght . "\n\n";
+	}
+
+	parseSAM($strand, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits);
+}
+
+warn "Reaching the end\n";
+
+print_pileup();
+
+warn "Reached the end\n";
+exit;
+
+##### SUBROUTINES ######
+
+sub parseSAM{
+	my ($strand, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits) = @_;
+	my @splitQual = split("",$qual);
+	my @splitSeq = $strand ? split("",uc($seq)) : split("",lc($seq));
+	my ($length, $c, $delCorrection) = (0,0,0);
+	my @read = ();
+	my @edit = ();
+	my @insertions = ();
+	my @deletions = ();
+	
+
+	$bestHits = $bestHits eq 'X0:i:1' ? 1 : 0;
+
+
+	#Check if sequence does NOT contains any insertions or deletions or mismatches
+	if ($editString =~ m/^MD:Z:\d+$/ && $cigar =~ m/^(\d+)M$/){
+		#perfect match
+		$length = $1;
+		addToPileupPerfectMatch($positions, $chrom, $cord, $strand, $seq, $cigar, $editString, $length, \@read, \@edit,\@insertions, \@deletions, \@splitSeq, \@splitQual, $bestHits);
+		return;
+	}
+
+	# go through editstring
+	while($editString =~ m/(\d+|[\^ACGTN]+)/g){
+		my $change = $1;
+#		warn "$chrom\t$cord\t$change\n";
+		if ($change =~ m/(^\d+$)/){
+			foreach (1..$change){
+				push(@edit, $strand ? '.' : ',');
+				$c ++;
+			}
+		}else{
+			if ($change =~ m/\^/){
+				$change =~ s/\^//;
+				$change = $strand ? uc($change) : lc($change);
+				push(@deletions, '-' . length($change) . $change);
+			}else{
+				push(@edit, 'X') foreach (1..length($change));
+			}
+			$c += length($change);
+		}
+	}
+	$c = 0;
+	# process CIGAR string
+	while( $cigar =~ m/(\d+)([MIDS])/g){
+		$length += $1 unless ($2 eq 'I');
+		$length += $1 if ($2 eq 'D');
+		$delCorrection -= $1 if ($2 eq 'D');
+		if ($2 eq 'I'){
+			my $insert;
+			my @blank;
+			foreach my $i (0..$1-1){
+				push(@blank, ' ');
+				$insert .= $splitSeq[$c + $i + $delCorrection];
+			}
+			splice(@edit,$delCorrection+$c-1,1,($edit[$delCorrection+$c-1], @blank));
+			$insert = $strand ? uc($insert) : lc($insert);
+			push(@insertions,  '+' . $1 . $insert);
+		}
+		if ($2 eq 'S'){
+			if ($c < 1){
+				unshift(@edit, 'S') foreach (0..$1-1);
+			}else{
+				push(@edit, 'S') foreach (0..$1-1);
+			}
+		}
+		push(@read, $2) foreach (1..$1);
+		$c+=$1;
+	}
+	addToPileup($positions, $chrom, $cord, $seq, $cigar, $editString, $length, \@read, \@edit,\@insertions, \@deletions, \@splitSeq, \@splitQual, $bestHits);
+	return;
+    #####################################################  SUBROUTINES OF PARSE SAM SUBROUTINE  #########################################
+    sub next_reference_sequence {
+	my ($target_chromosome, $target_chromosome_found, $next_chromosome_is_target) = ('',0,0);
+	(scalar(@_)) ? ($target_chromosome = shift) : ($target_chromosome_found = 1);
+	warn "Target chromosome: ",$target_chromosome,"\n";
+
+	$next_chromosome_is_target = 1 if ("$next_chromosome" eq "$target_chromosome");
+	
+	#continue processing reference file
+	my @referenceArray;
+	while (<REF>){
+	    chomp;
+	    if ($_ !~ m/>/){
+		    push(@referenceArray, $_) if $next_chromosome_is_target;
+	    }else{
+		warn "Now at chromosome $_\n";
+		$current_chromosome = $next_chromosome;
+		$next_chromosome = $1 if ($_ =~ />(\w+)\s*/);
+		$target_chromosome_found = 1 if ($next_chromosome_is_target);
+		$next_chromosome_is_target = 1 if ("$next_chromosome" eq "$target_chromosome");
+		last if $target_chromosome_found;
+	    }
+	}
+	$current_chromosome = $next_chromosome if (eof (REF));
+	return join('', @referenceArray);
+    }
+    sub print_pileup {
+	my ($cord, $chrom) = (0,'');
+	my $print_all = 0;
+	return if scalar (keys(%{$positions})) == 0;
+	if (scalar(@_)){
+		($cord, $chrom) = @_;
+	}else{
+		$print_all = 1;
+		warn "Printing all remaining in buffer\n\n";
+		$chrom = (keys(%{$positions}))[0];
+	}
+	
+	foreach my $pos (sort {$a <=> $b} keys(%{$positions->{$chrom}})){
+		if (($pos < $cord) || $print_all){
+			my $printString = "$chrom\t$pos\t";
+			next if $referenceLenght < $pos; # all calls made after the end of the chromosome will be ignored
+
+			my $referenceBase = substr($reference, $pos-1, 1);
+
+			next if ($opt{'noref'} && join('', @{$positions->{$chrom}->{$pos}->{2}}) =~ m/^$referenceBase+$/i);
+
+			$printString .= scalar(@{$positions->{$chrom}{$pos}{2}}) . "\t";
+
+			$printString .= "\n";
+			delete($positions->{$chrom}{$pos});
+
+			if ($outputFile){
+				print OUT $printString;
+			}else{
+				print $printString;
+			}
+
+		}
+	}
+
+    } # end sub print_pileup
+} # end sub parseSam
+
+sub addToPileup {
+	my ($positions, $chrom, $cord, $seq, $cigar, $editString, $length, $read, $edit, $insertions, $deletions, $splitSeq, $splitQual, $bestHits) = @_;
+	my ($readCord, $refCord, $indel) = (0,0,0);
+	foreach my $tmpCord (0..$#{$read}){
+	    if ($read->[$tmpCord] eq 'M'){
+		$indel = 0;
+		#position
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{0}}, chr($readCord));
+		#quality
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{1}}, $splitQual->[$readCord]);
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{2}}, $splitSeq->[$readCord]);
+
+		### TESTING ####
+		#besthit flag
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{3}}, $bestHits);
+
+		$refCord ++; $readCord ++;
+	    }elsif($read->[$tmpCord] eq 'I'){
+		$positions->{$chrom}->{$cord+$refCord-1}->{2}->[-1] .= shift(@{$insertions}) unless $indel;
+		$indel++; $readCord ++;
+		#refCord does not change;
+	    }elsif($read->[$tmpCord] eq 'D'){
+		$positions->{$chrom}->{$cord+$refCord-1}->{2}->[-1] .= shift(@{$deletions}) unless $indel;
+		$indel++; $refCord ++;
+		#readCord does not change;
+	    }elsif($read->[$tmpCord] eq 'S'){
+		$indel = 0; $readCord ++;
+		#refCord does not change;
+	    }
+	}
+}
+
+sub addToPileupPerfectMatch {
+	my ($positions, $chrom, $cord, $strand, $seq, $cigar, $editString, $length, $read, $edit, $insertions, $deletions, $splitSeq, $splitQual, $bestHits) = @_;
+	my ($readCord, $refCord, $indel) = (0,0,0);
+	my $perfectMatch = $strand ? '.' : ',';
+	foreach my $tmpCord (0..$length-1){
+		$indel = 0;
+		#position
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{0}}, chr($readCord));
+		#quality
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{1}}, $splitQual->[$readCord]);
+		#call information
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{2}}, $splitSeq->[$readCord]);
+		### TESTING ####
+		#besthit flag
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{3}}, $bestHits);
+		$refCord ++; $readCord ++;
+	}
+}
+
+sub sort_filehandels {
+	my $fhs = shift;
+
+# 	; # new structure to store the sorted structure
+
+	my @fhs_sorted = sort{ $a->[1] cmp $b->[1] || $a->[2] <=> $b->[2] } @$fhs;
+
+	return \@fhs_sorted;
+}
+
+sub next_sam_line {
+
+	my $fhs = shift;
+
+	$fhs = sort_filehandels($fhs);
+
+	my $fh = $fhs->[0]->[0];
+
+	my ($strand, $editString, $bestHits);
+	my $line_ref = $fhs->[0]->[3];
+	my @line = @{$line_ref};
+	my ($flag, $chrom, $cord, $cigar, $seq, $qual, @options) = ($line[1] ,$line[2],$line[3],$line[5],$line[9],$line[10], @line[11 .. $#line]);
+	# check where the editstring field is
+	foreach my $opt ( @options) {
+		if ($opt =~ /MD\:Z/) {
+			$editString = $opt;
+		}
+		if ($opt =~ /X0\:i/) {
+			$bestHits = $opt;
+		}
+	}
+
+	if (defined(my $data = <$fh>)){
+
+		my @line = split("\t", $data);
+		my ($chrom, $cord) = ($line[2],$line[3]);
+
+		$fhs->[0]->[1] = $chrom;
+		$fhs->[0]->[2] = $cord;
+
+		$fhs->[0]->[3] = \@line
+	}else{
+		##Delete the first element of the array reference
+		## can use some improving;
+
+		my @new_fhs = @$fhs;
+		shift(@new_fhs);
+		$fhs = \@new_fhs;
+	}
+
+	return ($fhs, $strand, $flag, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits);
+}
+
+sub open_bams {
+
+	my ($region, @bamfiles) = @_;
+	my @fhs;
+
+	foreach my $bamfile (@bamfiles){
+		if (not -e $bamfile){
+			die "The file $bamfile does not exist, ignoring...\n";
+		}else{
+			# Open filehande for bamfile 
+			my $fh = new IO::File "hpc/cog_bioinf/common_scripts/samtools/samtools view $bamfile $region |";
+
+			my @new_fh;
+
+			if (defined(my $data = <$fh>)){
+
+				warn "opened: $bamfile\n";
+
+				my @line = split("\t", $data);
+				my ($chrom, $cord) = ($line[2],$line[3]);
+				# check where the editstring field is
+
+				$new_fh[0] = $fh;
+				$new_fh[1] = $chrom;
+				$new_fh[2] = $cord;
+				$new_fh[3] = \@line;
+
+				push(@fhs, \@new_fh);
+
+			}
+		}
+	}
+
+	if (scalar(@fhs) < 1){
+		die "No valid BAM files found, terminating.\n\n";
+	}
+
+	return \@fhs;
+}
+

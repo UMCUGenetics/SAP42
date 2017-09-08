@@ -1,0 +1,732 @@
+#!/usr/bin/perl -w
+use strict;
+use Getopt::Long;
+#########################################################
+#	pileupper script to replace samtools pileup	#
+#	Frans Paul Ruzius / Ies Nijman			#
+#	v1.01 - dd 02-07-2010				
+#							
+#	last changes:
+#	- fixed bug with call information
+#	- outputfile is optional, not defined is stdout
+#
+#########################################################
+
+# ======================================================
+# Getting and checking options
+# ======================================================
+
+my $usage = "./SAP42_pileup 
+	-ref <Fasta reference> (required) 
+	-bam <BAM> (required) 
+	-region <chr|chr:start|chr:start-end> (optional) 
+	-out <output.pileup> (optional)
+	-onlyvar 
+	-all
+	-list
+	-samtools
+	
+\n";
+
+my %opt = (
+	'help' => 0, 
+	'ref' => undef,               	# OBLIGATORY: reference file
+	'out' => undef,             	# OPTIONAL: output file
+	'bam' => undef,			# OBLIGATORY: bam file
+	'region' => undef,		# OPTIONAL: region chr or chr:start-end
+	'samtools'=> '/hpc/cog_bioinf/common_scripts/samtools/samtools',
+);
+
+GetOptions ('help|h|?' => \$opt{help}, 	"bam=s" 	=> \$opt{'bam'},
+					"out=s" 	=> \$opt{'out'}, 
+					"ref=s" 	=> \$opt{'ref'}, 
+					"region=s" 	=> \$opt{'region'},
+					"list=s" 	=> \$opt{'list'},
+					"onlyvar" 	=> \$opt{'onlyvar'},
+					"samtools=s" 	=> \$opt{'samtools'},
+					"all" 	=> \$opt{'all'},
+					 ) || die "ERROR: Illegal arguments or parameters: @ARGV\n";
+
+die "$usage\n" if $opt{help};
+die "$usage\n" unless $opt{ref};
+die "$usage\n" unless $opt{bam};
+die "samtools not found\n" unless -e $opt{samtools};
+# die "$usage\n" unless $opt{out};
+
+my $list;
+
+if (defined($opt{'list'})){
+	$list = openList($opt{'list'});
+}
+
+# use Data::Dumper;
+# print Dumper($list) . "\n";
+
+if ($opt{'all'}){
+	$opt{'onlyvar'} = 0;
+}
+
+my $referenceFile = $opt{ref};
+
+my $outputFile = '';
+
+if ($opt{'out'}){
+	$outputFile = $opt{'out'};
+}else{
+	$outputFile = 0;
+	$opt{out} = '';
+}
+
+my $bam = $opt{'bam'};
+my $region = defined($opt{'region'}) ? $opt{'region'} : '';
+
+die "reference file $referenceFile does not exist\n" unless -e $referenceFile;
+die "bam file $bam does not exist\n" unless -e $bam;
+if ($region) {
+    die "region $region not correctly formatted chr:start-end\n" unless ( $region =~ /\w+:?\d{0,}\-?\d{0,}/);
+}
+
+my $region_start = -1;
+my $region_stop = -1;
+my $region_chromosome = '';
+my $region_selected = 0;
+
+if ($region =~ /(\w+:?)(\d{0,})\-?(\d{0,})/){
+	$region_start = $2;
+	print "Selection at $region_start\n\n";
+	$region_stop = $3;
+	$region_chromosome = $1;
+	$region_selected = 1;
+}else{
+	print "Selection at $region_start\n\n";
+}
+
+if ($outputFile){
+	open OUT, ">" . $outputFile or die "cannot open out file: $!\n";
+	warn "Output is send to " . $outputFile . "\n\n";
+}else{
+	warn "Output is send to standard-out\n\n";
+}
+
+my ($currentPosition, $next_chromosome, $current_chromosome) = (0,'','');
+my @referenceArray;
+my $positions = {};
+################################################################## CHECKS DONE: PROCEED ###############################
+# check first fasta header
+open (REF, "<$referenceFile") or die "cannot open ref $referenceFile: $!\n";
+$current_chromosome = <REF>;
+chomp $current_chromosome;
+$current_chromosome =~ s/\s.+$//;
+$current_chromosome =~ s/>//;
+
+while (<REF>){
+	chomp;
+	if ($_ !~ m/>/){
+		push(@referenceArray, $_);
+	}else{
+		$next_chromosome = $1 if ($_ =~ />(\w+)\s*/);
+		last;
+	}
+}
+
+my $reference = join("", @referenceArray);
+my $referenceLenght = length($reference);
+
+warn "Loaded first chromosome $current_chromosome\n";
+warn "Length " . $referenceLenght . "\n\n";
+
+# start going trough the BAM file by converting to SAM and running through the lines
+
+my $not_ready = -1;
+
+if (defined($list)){
+
+	while($not_ready){
+
+		$not_ready--;
+
+		my $last_coordinate = 0;
+		my $last_sam_coordinate = 0;
+
+		my @coordinates = ();
+
+		if (defined($list->{$current_chromosome})){
+			print "Defined here!\n";
+			@coordinates = @{$list->{$current_chromosome}->[0]};
+		}else{
+			print "Not defined here!\n";
+		}
+
+		while (scalar(@coordinates)){
+
+			my @concidered_positions = ();
+
+			my $coordinate = shift(@coordinates);
+			my $stop_coordinate = $coordinate;
+
+			push(@concidered_positions, $coordinate);
+
+			while (scalar(@coordinates)){
+				if ((($coordinates[0] - $coordinate)) < 58){
+					$stop_coordinate = shift(@coordinates);
+					push(@concidered_positions, $stop_coordinate);
+				}else{
+					last;
+				}
+			}
+
+			$last_coordinate = $stop_coordinate;
+
+			open BAM, $opt{'samtools'} . " view $bam $current_chromosome:$coordinate-$stop_coordinate|" or die "cannot open BAM file\n";
+
+			my $lines_in_sam = 0;
+
+			while (my $data = <BAM>) {
+				chomp($data);
+
+				$lines_in_sam++;
+				$last_sam_coordinate = $coordinate;
+
+				my ($strand, $editString, $bestHits);
+				my @line = split("\t", $data);
+				my ($flag, $chrom, $cord, $cigar, $seq, $qual, @options) = ($line[1] ,$line[2],$line[3],$line[5],$line[9],$line[10], @line[11 .. $#line]); 
+				# check where the editstring field is
+				foreach my $opt ( @options) {
+					if ($opt =~ /MD\:Z/) {
+						$editString = $opt;
+					}
+					if ($opt =~ /X0\:i/) {
+						$bestHits = $opt;
+					}
+				}
+				
+				next if not get_mappded_info_from_flag($flag); #read is unmapped, skip
+				$strand = get_strand_from_flag($flag);
+			
+				parseSAM($strand, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits);
+			}
+
+			print $current_chromosome . "\t" . join(',', @concidered_positions) . "                     \r";
+			print_pileup_position($current_chromosome, \@concidered_positions);
+			$positions = {};
+		}
+
+		if ($next_chromosome eq $current_chromosome){
+			last;
+		}
+
+		$region_start = $last_sam_coordinate;
+		$region_stop = $last_coordinate;
+
+# 		print_pileup(); # print remainder
+		$positions = {};
+		$reference = next_reference_sequence($next_chromosome);
+		$referenceLenght = length($reference);
+		warn "Loaded chromosome $current_chromosome\n";
+		warn "Length " . $referenceLenght . "\n\n";
+		$region_start = -1;
+		$region_stop = -1;
+
+		if ($next_chromosome eq $current_chromosome){
+			$not_ready = 1;
+		}
+
+	}
+
+}else{
+
+	#open a bam completely and pile it all up!
+
+	open BAM, $opt{'samtools'} . " view $bam $region|" or die "cannot open BAM file\n";
+
+	while (my $data = <BAM>) {
+		chomp($data);
+		my ($strand, $editString, $bestHits);
+		my @line = split("\t", $data);
+		my ($flag, $chrom, $cord, $cigar, $seq, $qual, @options) = ($line[1] ,$line[2],$line[3],$line[5],$line[9],$line[10], @line[11 .. $#line]); 
+		# check where the editstring field is
+		foreach my $opt ( @options) {
+			if ($opt =~ /MD\:Z/) {
+				$editString = $opt;
+			}
+
+			if ($opt =~ /X0\:i/) {
+				$bestHits = $opt;
+			}
+		}
+		
+		next if not get_mappded_info_from_flag($flag); #read is unmapped, skip
+		$strand = get_strand_from_flag($flag);
+		
+		if ($chrom eq "$current_chromosome"){
+		print_pileup($cord, $chrom);
+	# 		print $cord . "\n";
+		}else{
+			print_pileup(); # print remainder
+			$positions = {};
+			$reference = next_reference_sequence($chrom);
+			$referenceLenght = length($reference);
+			warn "Loaded chromosome $current_chromosome\n";
+			warn "Length " . $referenceLenght . "\n\n";
+		}
+	
+		parseSAM($strand, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits);
+	
+	}
+
+}
+
+print_pileup();
+
+if ($outputFile){
+	print OUT "#END\n";
+}else{
+	print "#END\n";
+}
+
+############################################ SUBROUTINES ##########################################################################################3
+sub parseSAM{
+	my ($strand, $chrom, $cord, $cigar, $seq, $qual, $editString, $bestHits) = @_;
+	my @splitQual = split("",$qual);
+	my @splitSeq = $strand ? split("",uc($seq)) : split("",lc($seq));
+	my ($length, $c, $delCorrection) = (0,0,0);
+	my @read = ();
+	my @edit = ();
+	my @insertions = ();
+	my @deletions = ();
+	
+	$bestHits = $bestHits eq 'X0:i:1' ? 1 : 0;
+
+	#Check if sequence does NOT contains any insertions or deletions or mismatches
+	if ($editString =~ m/^MD:Z:\d+$/ && $cigar =~ m/^(\d+)M$/){
+		#perfect match
+		$length = $1;
+		addToPileupPerfectMatch($positions, $chrom, $cord, $strand, $seq, $cigar, $editString, $length, \@read, \@edit,\@insertions, \@deletions, \@splitSeq, \@splitQual, $bestHits);
+		return;
+	}
+	# go through editstring
+	while($editString =~ m/(\d+|[\^ACGTN]+)/g){
+		my $change = $1;
+#		warn "$chrom\t$cord\t$change\n";
+		if ($change =~ m/(^\d+$)/){
+			foreach (1..$change){
+				push(@edit, $strand ? '.' : ',');
+				$c ++;
+			}
+		}else{
+			if ($change =~ m/\^/){
+				$change =~ s/\^//;
+				$change = $strand ? uc($change) : lc($change);
+				push(@deletions, '-' . length($change) . $change);
+			}else{
+				push(@edit, 'X') foreach (1..length($change));
+			}
+			$c += length($change);
+		}
+	}
+	$c = 0;
+	# process CIGAR string
+	while( $cigar =~ m/(\d+)([MIDS])/g){
+		$length += $1 unless ($2 eq 'I');
+		$length += $1 if ($2 eq 'D');
+		$delCorrection -= $1 if ($2 eq 'D');
+		if ($2 eq 'I'){
+			my $insert;
+			my @blank;
+			foreach my $i (0..$1-1){
+				push(@blank, ' ');
+				$insert .= $splitSeq[$c + $i + $delCorrection];
+			}
+			splice(@edit,$delCorrection+$c-1,1,($edit[$delCorrection+$c-1], @blank));
+			$insert = $strand ? uc($insert) : lc($insert);
+			push(@insertions,  '+' . $1 . $insert);
+		}
+		if ($2 eq 'S'){
+			if ($c < 1){
+				unshift(@edit, 'S') foreach (0..$1-1);
+			}else{
+				push(@edit, 'S') foreach (0..$1-1);
+			}
+		}
+		push(@read, $2) foreach (1..$1);
+		$c+=$1;
+	}
+
+	addToPileup($positions, $chrom, $cord, $seq, $cigar, $editString, $length, \@read, \@edit,\@insertions, \@deletions, \@splitSeq, \@splitQual, $bestHits);
+	return;
+    #####################################################  SUBROUTINES OF PARSE SAM SUBROUTINE  #########################################
+    sub next_reference_sequence {
+	my ($target_chromosome, $target_chromosome_found, $next_chromosome_is_target) = ('',0,0);
+	(scalar(@_)) ? ($target_chromosome = shift) : ($target_chromosome_found = 1);
+	warn "Target chromosome: ",$target_chromosome,"\n";
+
+	$next_chromosome_is_target = 1 if ("$next_chromosome" eq "$target_chromosome");
+	
+	#continue processing reference file
+	my @referenceArray;
+	while (<REF>){
+	    chomp;
+	    if ($_ !~ m/>/){
+		    push(@referenceArray, $_) if $next_chromosome_is_target;
+	    }else{
+		$current_chromosome = $next_chromosome;
+		$next_chromosome = $1 if ($_ =~ />(\w+)\s*/);
+		$target_chromosome_found = 1 if ($next_chromosome_is_target);
+		$next_chromosome_is_target = 1 if ("$next_chromosome" eq "$target_chromosome");
+		last if $target_chromosome_found;
+	    }
+	}
+
+	$current_chromosome = $next_chromosome if (eof (REF));
+	return join('', @referenceArray);
+    }
+
+    sub print_pileup {
+	my ($cord, $chrom) = (0,'');
+	my $print_all = 0;
+	return if scalar (keys(%{$positions})) == 0;
+	if (scalar(@_)){
+		($cord, $chrom) = @_;
+	}else{
+		$print_all = 1;
+		warn "Printing all remaining in buffer\n\n";
+		$chrom = (keys(%{$positions}))[0];
+	}
+	
+	foreach my $pos (sort {$a <=> $b} keys(%{$positions->{$chrom}})){
+
+		if (($pos < $cord) || $print_all){
+
+			my $printString = "";
+
+			if (($region_start <= $pos) && $opt{'all'}){
+
+				FILLUP: foreach my $uncoverd_positions ($region_start..$pos-1){
+
+# 					print $uncoverd_positions . "\n";
+					if (defined($list)){
+						if (defined($list->{$chrom})){
+							if (defined($list->{$chrom}->[1]->{$uncoverd_positions})){
+# 								print $uncoverd_positions . "\n";
+								my $referenceBase = substr($reference, $uncoverd_positions-1, 1);
+								$printString .= "$chrom\t$uncoverd_positions\t$referenceBase\t0\n";
+							}else{
+								next FILLUP;
+							}
+						}else{
+							next FILLUP;
+						}
+					}else{
+# 						print $uncoverd_positions . "\n";
+						my $referenceBase = substr($reference, $uncoverd_positions-1, 1);
+						$printString .= "$chrom\t$uncoverd_positions\t$referenceBase\t0\n";
+					}
+				}
+			}
+
+			if ($printString){
+				if ($outputFile){
+					print OUT $printString;
+				}else{
+					print $printString;
+				}
+				$printString = "";
+			}
+
+			$region_start = $pos+1;
+
+			$printString .= "$chrom\t$pos\t";
+			next if $referenceLenght < $pos; # all calls made after the end of the chromosome will be ignored
+			my $referenceBase = substr($reference, $pos-1, 1);
+
+# 			print $pos . "\n";
+
+			my $referenceString = join('', @{$positions->{$chrom}->{$pos}->{2}});
+			my $only_reference_calls = 0;
+			
+			if ($referenceString =~ m/^$referenceBase+$/i){
+				$only_reference_calls = 1;
+			}
+
+			if ($opt{'onlyvar'} && $only_reference_calls){
+				delete($positions->{$chrom}{$pos});
+				next;
+			}
+
+			if (defined($list)){
+				if (defined($list->{$chrom})){
+					if (defined($list->{$chrom}->[1]->{$pos})){
+# 						print "$chrom\t$pos\n";
+					}else{
+						delete($positions->{$chrom}{$pos});
+						next;
+					}
+				}else{
+					delete($positions->{$chrom}{$pos});
+					next;
+				}
+			}
+
+			my $referenceBaseLC = lc($referenceBase);
+			my $referenceBaseUC = uc($referenceBase);
+
+			$printString .= $referenceBase . "\t";
+
+			foreach my $c (0..(scalar(@{$positions->{$chrom}->{$pos}->{2}})-1)){
+				$positions->{$chrom}{$pos}{2}->[$c] =~ s/^$referenceBaseUC/./;
+				$positions->{$chrom}{$pos}{2}->[$c] =~ s/^$referenceBaseLC/,/;
+			}
+
+			$printString .= scalar(@{$positions->{$chrom}{$pos}{2}}) . "\t";
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{2}}) . "\t";
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{1}}) . "\t";
+			$printString .= ord($positions->{$chrom}{$pos}{0}->[0]);
+
+			foreach my $chr (1..(scalar(@{$positions->{$chrom}{$pos}{0}})-1)){
+				$printString .= "," . ord($positions->{$chrom}{$pos}{0}->[$chr]);
+			}
+
+			$printString .= "\t";
+
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{3}}); # unique flag
+
+			$printString .= "\n";
+			delete($positions->{$chrom}{$pos});
+
+			if ($outputFile){
+				print OUT $printString;
+			}else{
+				print $printString;
+			}
+
+		}
+	}
+
+	if ($print_all && $opt{'all'}){
+
+		my $printString = '';
+
+		if ($region_stop > length($reference)){
+			$region_stop = length($reference);
+		}
+
+		if ($region_stop > $region_start){
+			UNCOVERED: foreach my $uncoverd_positions ($region_start..$region_stop){
+
+				if (defined($list)){
+					if (defined($list->{$chrom})){
+						if (defined($list->{$chrom}->[1]->{$uncoverd_positions})){
+# 							print $uncoverd_positions . "\n";
+							my $referenceBase = substr($reference, $uncoverd_positions-1, 1);
+							$printString .= "$chrom\t$uncoverd_positions\t$referenceBase\t0\n";
+						}else{
+							next UNCOVERED;
+						}
+					}else{
+						next UNCOVERED;
+					}
+				}else{
+# 					print $uncoverd_positions . "\n";
+					my $referenceBase = substr($reference, $uncoverd_positions-1, 1);
+					$printString .= "$chrom\t$uncoverd_positions\t$referenceBase\t0\n";
+				}
+
+				#DEBUG
+				
+
+			}
+		}
+		if ($outputFile){
+			print OUT $printString;
+		}else{
+			print $printString;
+		}
+
+	}
+
+    } # end sub print_pileup
+
+
+
+
+
+
+
+    sub print_pileup_position {
+	my ($chrom, $requested_ref) = @_;
+	
+	foreach my $pos (@{$requested_ref}){
+
+			my $printString = "";
+
+			if (not defined($positions->{$chrom}->{$pos})){
+				if ($opt{all}){
+					my $referenceBase = substr($reference, $pos-1, 1);
+					$printString .= "$chrom\t$pos\t$referenceBase\t0\n";
+				}
+			}
+
+			if ($printString){
+				if ($outputFile){
+					print OUT $printString;
+				}else{
+					print $printString;
+				}
+				next;
+			}
+
+			
+
+			$region_start = $pos+1;
+
+			$printString .= "$chrom\t$pos\t";
+			next if $referenceLenght < $pos; # all calls made after the end of the chromosome will be ignored
+			my $referenceBase = substr($reference, $pos-1, 1);
+
+# 			print $pos . "\n";
+
+			next if (not defined($positions->{$chrom}->{$pos}->{2}));
+
+			my $referenceString = join('', @{$positions->{$chrom}->{$pos}->{2}});
+			my $only_reference_calls = 0;
+			
+			if ($referenceString =~ m/^$referenceBase+$/i){
+				$only_reference_calls = 1;
+			}
+
+			my $referenceBaseLC = lc($referenceBase);
+			my $referenceBaseUC = uc($referenceBase);
+
+			$printString .= $referenceBase . "\t";
+
+			foreach my $c (0..(scalar(@{$positions->{$chrom}->{$pos}->{2}})-1)){
+				$positions->{$chrom}{$pos}{2}->[$c] =~ s/^$referenceBaseUC/./;
+				$positions->{$chrom}{$pos}{2}->[$c] =~ s/^$referenceBaseLC/,/;
+			}
+
+			$printString .= scalar(@{$positions->{$chrom}{$pos}{2}}) . "\t";
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{2}}) . "\t";
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{1}}) . "\t";
+			$printString .= ord($positions->{$chrom}{$pos}{0}->[0]);
+
+			foreach my $chr (1..(scalar(@{$positions->{$chrom}{$pos}{0}})-1)){
+				$printString .= "," . ord($positions->{$chrom}{$pos}{0}->[$chr]);
+			}
+
+			$printString .= "\t";
+
+			$printString .= join("" , @{$positions->{$chrom}{$pos}{3}}); # unique flag
+
+			$printString .= "\n";
+			delete($positions->{$chrom}{$pos});
+
+			if ($outputFile){
+				print OUT $printString;
+			}else{
+				print $printString;
+			}
+
+	}
+
+    } # end sub print_pileup
+
+
+
+} # end sub parseSam
+
+sub addToPileup {
+	my ($positions, $chrom, $cord, $seq, $cigar, $editString, $length, $read, $edit, $insertions, $deletions, $splitSeq, $splitQual, $bestHits) = @_;
+	my ($readCord, $refCord, $indel) = (0,0,0);
+	foreach my $tmpCord (0..$#{$read}){
+	    if ($read->[$tmpCord] eq 'M'){
+		$indel = 0;
+		#position
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{0}}, chr($readCord));
+		#quality
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{1}}, $splitQual->[$readCord]);
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{2}}, $splitSeq->[$readCord]);
+
+		### TESTING ####
+		#besthit flag
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{3}}, $bestHits);
+
+		$refCord ++; $readCord ++;
+	    }elsif($read->[$tmpCord] eq 'I'){
+		$positions->{$chrom}->{$cord+$refCord-1}->{2}->[-1] .= shift(@{$insertions}) unless $indel;
+		$indel++; $readCord ++;
+		#refCord does not change;
+	    }elsif($read->[$tmpCord] eq 'D'){
+		$positions->{$chrom}->{$cord+$refCord-1}->{2}->[-1] .= shift(@{$deletions}) unless $indel;
+		$indel++; $refCord ++;
+		#readCord does not change;
+	    }elsif($read->[$tmpCord] eq 'S'){
+		$indel = 0; $readCord ++;
+		#refCord does not change;
+	    }
+	}
+}
+
+sub addToPileupPerfectMatch {
+	my ($positions, $chrom, $cord, $strand, $seq, $cigar, $editString, $length, $read, $edit, $insertions, $deletions, $splitSeq, $splitQual, $bestHits) = @_;
+	my ($readCord, $refCord, $indel) = (0,0,0);
+	my $perfectMatch = $strand ? '.' : ',';
+	foreach my $tmpCord (0..$length-1){
+		$indel = 0;
+		#position
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{0}}, chr($readCord));
+		#quality
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{1}}, $splitQual->[$readCord]);
+		#call information
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{2}}, $splitSeq->[$readCord]);
+		### TESTING ####
+		#besthit flag
+		push(@{$positions->{$chrom}->{$cord+$refCord}->{3}}, $bestHits);
+		$refCord ++; $readCord ++;
+	}
+}
+
+sub openList {
+	my $f = shift;
+
+	my %list;
+
+	open (IN, "<$f") or die "Can not open the list file: $!\n\n";
+
+	while (<IN>){
+		chomp;
+		if ($_ =~ m/^#/){
+			next;
+		}
+
+		if ($_ =~ m/^[0-9A-Za-z_]{2,}\t\d+/){
+			next;
+		}
+
+		my ($chromosome, $position, @rest) = split("\t");
+		push(@{$list{$chromosome}->[0]}, $position);
+# 		$list{$chromosome}->[1]->{$position}++;
+	}
+
+	foreach my $chromosome (keys(%list)){
+		my @sorted = sort{$a <=> $b} @{$list{$chromosome}->[0]};
+		$list{$chromosome}->[0] = \@sorted;
+	}
+
+	return \%list;
+}
+
+sub get_strand_from_flag {
+	my $f = shift;
+	if ( ($f & 16) or ($f & 1040) ){	#16 rev and 1040 rev dup
+		return 0;
+	}
+	return 1;
+}
+
+sub get_mappded_info_from_flag {
+	my $f = shift;
+	if ($f & 4){
+		return 0;
+	}
+	return 1;
+}

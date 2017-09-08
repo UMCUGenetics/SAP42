@@ -1,0 +1,135 @@
+#!/usr/bin/perl -w
+
+use strict;
+use CGI qw/:all/;
+
+use strict;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $s_email;
+my $s_name;
+my $s_pw;
+
+my $mailServer;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$s_email = $settings->{EMAILADRESS};
+	$s_name = $settings->{EMAILUSERNAME};
+	$s_pw = $settings->{EMAILPASSWORD};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+	$mailServer = $settings->{MAILSERVER};
+}
+
+use Getopt::Long;
+use MIME::Lite;
+
+my $usage = "SAP42 email [OPTIONS]
+	-to		Receiver email adress
+	-subject	Subject of the message
+	-file		File with the message (optional)
+	-sendmail	Location of the sendmail program [/usr/sbin/sendmail] (optional)
+	-attachment	File as attachment (optional)
+";
+
+my $emailAdress = '';
+my $subject = '';
+my $file = '';
+my $from = "SAP42-DX-HPC <$s_email>";
+my $sendmaillocation = '/usr/sbin/sendmail';
+my $attachment = '';
+my $result = GetOptions("to=s" => \$emailAdress, "subject=s"=>\$subject, "file=s"=>\$file, "sendmail=s"=>\$sendmaillocation, "attachment=s"=>\$attachment);
+
+if (!$emailAdress || !$subject){
+	die $usage . "\n";
+}
+
+my $query=new CGI;
+ 
+ ####
+ #about the -t option:
+ #Read message for recipients. To:, Cc:, and Bcc:
+ #lines will be scanned for recipient addresses. The
+ #Bcc: line will be deleted before transmission.
+ ####
+ 
+my $sendmail="$sendmaillocation -t";
+ my $to="$emailAdress"; #you
+
+my @message;
+
+if ($file){
+	open (IN, "<$file") or die "Can not open $file: $!\n";
+	@message = <IN>;
+	chomp(@message);
+}else{
+	@message = <STDIN>;
+}
+
+push(@message, "", "", "---------", "This is an automated generated message", "Please do not reply", "---------");
+ 
+my $content=join("\n", @message) . "\n";
+ 
+unless ($content && $from) {
+  print $query->header;
+  print "Please fill in your informations and try again";
+ }
+
+
+
+my $msg = MIME::Lite->new(
+    From    => $from,
+    To      => $emailAdress,
+    Subject => $subject,
+    Type    => 'multipart/mixed',
+#    Data    => $content,
+);
+
+if ($attachment){
+	my $type = 'text/plain';
+ 	if ($attachment =~ m/pdf$/i){
+		#$type = 'image/png';
+		$type = 'application/pdf';
+ 	}
+	
+
+	if (-e $attachment){
+		$msg->attach(
+		Type     => $type,
+		Path     => $attachment,
+		#     Filename => 'results.pdf',
+		);
+	}else{
+		$content .= "\nAn attachment named\n$attachment\nwas tried to send, however this file does not exists: so it was not send\n";
+	}
+
+}
+
+
+$msg->attach(
+	Type => 'TEXT',
+	Data => $content
+);
+
+
+MIME::Lite->send('smtp', $mailServer, Timeout=>60);
+
+
+$msg->send;
+

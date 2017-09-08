@@ -1,0 +1,266 @@
+#!/usr/bin/perl -w
+
+use strict;
+#####################################
+#Script will merge libraries (bams) over multiple lanes. 
+#If found in .conf files it will also rerun the Post-mapping statistics and /or variant calling.
+#Only argument : main work directory (usually runname)
+#####################################
+
+######PIPELINE GENERIC CODE#########
+
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $tmpFolder;
+my $webnode;
+my $submitnode;
+my $release;
+my $samtools;
+my $picard;
+my $sambamba;
+use POSIX qw(tmpnam);
+
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+	$tmpFolder = $settings->{TMPFOLDER};
+	$webnode = $settings->{WEBNODE};
+	$submitnode = $settings->{SUBMITNODE};
+	$samtools = $settings->{SAMTOOLS};
+	$picard = $settings->{PICARDTOOLS};
+	$sambamba = $settings->{SAMBAMBA};
+	$settings = settings::loadConfiguration("$projectLocation/version.ini");
+	
+# 	print $submitnode . "\n\n";
+# 	print $samtools . "\n\n";
+}
+
+
+
+# require config;
+
+######SCRIPT SPECIFIC CODE#########
+
+my $workDir = shift;	#Directory to search for libraries (Should be the same as the run-name)
+die "Not a valid directory" if ! -d $workDir;
+my $libraries = {};	#hash to store different libraries + configurations
+my $notComplete = {};
+my $runName = (split("/", $workDir))[-1];
+
+
+# Search for bams with the following name:
+# lane(1..6)_libraryname_tag_date.bam
+open(ERR, ">>$workDir/merge.err");
+open(LOG, ">>$workDir/merge.log");
+open(FIND, "find $workDir -name 'lane*bam' -o -name 'L0*bam' -o -name '0*bam' |") or die "Couldn't find any bams corresponding with searchpattern: lane(1..6)_libraryname_tag_date.bam";
+print LOG "Found the following bams for merging: \n";
+while(my $bamPath = <FIND>){
+	print LOG "\t",$bamPath;
+	chomp($bamPath);
+
+	my @bamPathParts = split('/', $bamPath);
+	my $bamName = $bamPathParts[-1];
+	my $confName = lc($bamName); $confName =~ s/.bam/.conf/g;
+	$bamName =~ s/.bam//;
+	my ($lane, $libName, $tag, $date) = split('_', $bamName);
+	my $bamDir = join('/', @bamPathParts[0..$#bamPathParts-1]);
+	
+
+	$libName = 'merged_'.$libName.'_'.$tag.'_'.$date;
+	if(-e "$bamDir/NoGo.err"){
+		$notComplete->{$libName} = '';
+		print ERR "Library $libName could not be merged, NoGo.err file present in $bamDir\n";
+		delete $libraries->{$libName};
+	}
+
+	if(! exists($notComplete->{$libName})){
+		$libraries->{$libName}->{$lane}->{'BAM'} = $bamPath;
+    		$libraries->{$libName}->{$lane}->{'CONF'} = "$bamDir/$confName" if -e "$bamDir/$confName";
+
+	}
+
+}
+
+close FIND;
+
+
+
+
+#exit;
+
+foreach my $libName (sort {$a cmp $b} keys %{$libraries}){
+
+	
+    	mkdir "$workDir/$libName";
+# ionice -c 2 -n 4 java -jar /data/common_scripts/picard-tools-1.62/MergeSamFiles.jar O= MERGED/$bc/$bc.bam VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=TRUE ASSUME_SORTED=TRUE  I=BAM1 I=BAM2 I=BAM3
+#     	my $mergeCommand = "$samtools merge $workDir/$libName/$libName\.bam ";
+    	
+	#my $mergeCommand = "java -Xms4G -Xmx7G -jar $picard/MergeSamFiles.jar O=$workDir/$libName/$libName\.bam VALIDATION_STRINGENCY=LENIENT CREATE_INDEX=TRUE ASSUME_SORTED=TRUE USE_THREADING=FALSE ";
+	my $mergeCommand = "$sambamba merge -t 6 $workDir/$libName/$libName\.bam ";
+	
+	my $mergedConfig = {};
+	$mergedConfig->{'NAME'} = $libName;
+	$mergedConfig->{'PROJECT'} = $libName;
+	$mergedConfig->{'RUNNAME'} = $runName;
+	$mergedConfig->{'SAMPLENAME'} = 'merged';
+# 	$mergedConfig->{'XSQ'} = 'none.xsq';
+# 	print $libName . "\n";
+	my ($l, $t) = (split('_', $libName))[1,2];
+	$mergedConfig->{'LIBRARYNAME'} = $l;
+	$mergedConfig->{'LIBTAG'} = $t;
+	my $libDir = "$workDir/$libName/"; 
+	
+	$libDir =~ s/\n//;
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($libDir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$libDir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+
+
+	$mergedConfig->{'PWD'} = $libDir;
+	
+	print LOG "Merging library (sambamba) $libName , using the following bams:\n";
+	
+
+
+	foreach my $lane (keys %{$libraries->{$libName}}){
+		$mergeCommand .= $libraries->{$libName}->{$lane}->{'BAM'} . " ";
+		print LOG "\t".$libraries->{$libName}->{$lane}->{'BAM'} . "\n";
+		
+		if (exists($libraries->{$libName}->{$lane}->{'CONF'})){
+			my $libConfig = readConfig($libraries->{$libName}->{$lane}->{'CONF'});
+			
+			$mergedConfig->{'PLATFORM'} = $libConfig->{'PLATFORM'} ? $libConfig->{'PLATFORM'} : 'unknown';
+			$mergedConfig->{'PRIORITY'} = $libConfig->{'PRIORITY'} ? $libConfig->{'PRIORITY'} : '0';
+			$mergedConfig->{'REFERENCE'} = $libConfig->{'REFERENCE'} ? $libConfig->{'REFERENCE'} : '';
+			$mergedConfig->{'EMAIL'} = $libConfig->{'EMAIL'} ? $libConfig->{'EMAIL'} : '';
+			$mergedConfig->{'POSTSTATS'} = $libConfig->{'POSTSTATS'} if exists($libConfig->{'POSTSTATS'});
+			$mergedConfig->{'DESIGN'} = $libConfig->{'DESIGN'} if exists($libConfig->{'DESIGN'});
+			$mergedConfig->{'VARIANTSETTINGS'} = $libConfig->{'VARIANTSETTINGS'} if exists($libConfig->{'VARIANTSETTINGS'});
+			$mergedConfig->{'VARIANTSPECIES'} = $libConfig->{'VARIANTSPECIES'} if exists($libConfig->{'VARIANTSPECIES'});
+			$mergedConfig->{'VARIANTEFFECTS'} = $libConfig->{'VARIANTEFFECTS'} if exists($libConfig->{'VARIANTEFFECTS'});
+			$mergedConfig->{'VARIANTFORCE'} = $libConfig->{'VARIANTFORCE'} if exists($libConfig->{'VARIANTFORCE'});
+			$mergedConfig->{'PILEUP'} = $libConfig->{'PILEUP'} if exists($libConfig->{'PILEUP'});
+			$mergedConfig->{'FULLPILEUP'} = $libConfig->{'FULLPILEUP'} if exists($libConfig->{'FULLPILEUP'});
+			$mergedConfig->{'CALLSNPS'} = $libConfig->{'CALLSNPS'} if exists($libConfig->{'CALLSNPS'});
+			$mergedConfig->{'CALLINDELS'} = $libConfig->{'CALLINDELS'} if exists($libConfig->{'CALLINDELS'});
+			$mergedConfig->{'SUBVERSION'} = $libConfig->{'SUBVERSION'} ? $libConfig->{'SUBVERSION'} : '0';
+			$mergedConfig->{'RELEASE'} = $libConfig->{'RELEASE'} ? $libConfig->{'RELEASE'} : 'unknown';
+		}
+		
+		
+		
+	}
+    	print LOG "\n";
+# 	print $mergeCommand . "\n";
+    	$mergeCommand .= "\n";
+        system($mergeCommand);
+        
+        #sambamba sep index, creates .bam.bai
+        system ("$sambamba index -t 6 $workDir/$libName/$libName\.bam");
+        
+        
+    	#my $index_rename = "mv $workDir/$libName/$libName\.bai $workDir/$libName/$libName\.bam.bai";
+	#system($index_rename); #rename .bai file to .bam.bai
+
+# 	my $postMergingSH = "$workDir/afterMerge.sh";
+
+# 	open(AFTERMERGE, ">$postMergingSH");
+	
+	
+
+	my $mergedConfigFile = printConfig($mergedConfig, "$libDir/".lc($libName).".conf");
+	if(exists($mergedConfig->{'POSTSTATS'})){
+		my $command = "perl $scriptRoot/SAP42_statistics --post $mergedConfigFile";
+		system($command);
+# 		print AFTERMERGE $command."\n\n";
+	}
+	if(exists($mergedConfig->{'VARIANTSETTINGS'})){
+		my $command = "perl $scriptRoot/SAP42_run_variants $mergedConfigFile";
+		system($command);
+# 		print AFTERMERGE $command."\n\n";
+	}
+# 	close AFTERMERGE;
+	
+	
+}
+
+sub printConfig{
+	my ($configHash, $configFile) = @_;
+
+	open (C, ">$configFile") or die "Couldn't create merged config file: $configFile\n";
+
+	print C "NAME\t".$configHash->{'NAME'}."\n";
+	print C "PROJECT\t".$configHash->{'PROJECT'}."\n";
+	print C "PLATFORM\t".$configHash->{'PLATFORM'}."\n";
+	print C "RUNNAME\t".$configHash->{'RUNNAME'}."\n";
+	print C "SAMPLENAME\t".$configHash->{'SAMPLENAME'}."\n";
+	print C "LIBRARYNAME\t".$configHash->{'LIBRARYNAME'}."\n";
+	print C "LIBTAG\t".$configHash->{'LIBTAG'}."\n";
+	print C "XSQ\tnone.xsq\n";
+	print C "PRIORITY\t".$configHash->{'PRIORITY'}."\n";
+	print C "PWD\t".$configHash->{'PWD'}."\n";
+	print C "REFERENCE\t".$configHash->{'REFERENCE'}."\n";
+	print C "EMAIL\t".$configHash->{'EMAIL'}."\n";
+	print C "POSTSTATS\t".$configHash->{'POSTSTATS'}."\n" if exists($configHash->{'POSTSTATS'});
+	print C "DESIGN\t".$configHash->{'DESIGN'}."\n" if exists($configHash->{'DESIGN'});
+	print C "VARIANTSETTINGS\t".$configHash->{'VARIANTSETTINGS'}."\n" if exists($configHash->{'VARIANTSETTINGS'});
+	print C "VARIANTSPECIES\t".$configHash->{'VARIANTSPECIES'}."\n" if exists($configHash->{'VARIANTSPECIES'});
+	print C "VARIANTEFFECTS\t".$configHash->{'VARIANTEFFECTS'}."\n" if exists($configHash->{'VARIANTEFFECTS'});
+	print C "VARIANTFORCE\t".$configHash->{'VARIANTFORCE'}."\n" if exists($configHash->{'VARIANTFORCE'});
+	print C "PILEUP\t".$configHash->{'PILEUP'}."\n" if exists($configHash->{'PILEUP'});
+	print C "FULLPILEUP\t".$configHash->{'FULLPILEUP'}."\n" if exists($configHash->{'FULLPILEUP'});
+	print C "CALLSNPS\t".$configHash->{'CALLSNPS'}."\n" if exists($configHash->{'CALLSNPS'});
+	print C "CALLINDELS\t".$configHash->{'CALLINDELS'}."\n" if exists($configHash->{'CALLINDELS'});
+	print C "SUBVERSION\t".$configHash->{'SUBVERSION'}."\n";
+	print C "RELEASE\t".$configHash->{'RELEASE'}."\n";
+	
+	close C;
+	return $configFile;
+
+}
+
+
+
+sub readConfig{
+	my $configFile = shift;
+	my $configHash = {};
+
+	open (C, "<$configFile") or die "Couldn't open config file: $configFile\n";
+# 	print $configFile . "\n";
+	while(<C>){
+		chomp;
+
+		next if m/^#/ or ! $_;
+		my ($name,$value) = split("\t");
+
+		$configHash->{$name}=$value;
+	}
+	close C;
+	return $configHash;
+
+}
+

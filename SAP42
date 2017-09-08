@@ -1,0 +1,22 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/hpc/cog_bioinf/common_scripts/SAP42-HPC';				#UMCU HPC
+use config;
+
+my $scriptRoot = "/hpc/cog_bioinf/common_scripts/SAP42-HPC/";
+
+my $helpMessage = "\n" . join("\t", 'create','run','split','variants', 'help') . "\n";
+
+my $program = shift(@ARGV) or die "$helpMessage\n";
+
+if ($program eq 'help'){
+	die "$helpMessage\n";
+}
+
+	print "$scriptRoot/SAP42_$program " . join(" ", @ARGV) . "\n\n";
+
+if (-e "$scriptRoot/SAP42_$program"){
+
+	print system("$scriptRoot/SAP42_$program " . join(" ", @ARGV));
+}

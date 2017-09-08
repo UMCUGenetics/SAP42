@@ -1,0 +1,347 @@
+
+
+body {
+	background-color:white;
+	font-family:arial;
+}
+
+div.header{
+
+	height:136px;
+	background-image:URL('../img/sap42_HPCweb2.jpg');
+	font-size:110px;
+	color: white;
+	font-weight: bold;
+
+}
+
+div.headerline{
+	float: left;
+	width:100%;
+	height:20px;
+	background-color:#106EC7;
+	
+}
+
+img.logo {
+	float:left;
+	margin-right:40px;
+	margin-top:20px;
+}
+
+img.versionlogo {
+	float:right;
+	margin-right:40px;
+	margin-top:20px;
+}
+
+div.menu{
+/* 	border-style:solid; */
+/* 	border-width:5px; */
+	height:100px;
+}
+
+div.selectFile{
+	padding-top:20px;
+	padding-left:20px;
+	padding-bottom:20px;
+}
+
+div.content{
+/* 	border-style:solid; */
+/* 	border-width:5px; */
+}
+
+div.container{
+/* 	border-style:dotted; */
+/* 	border-width:5px; */
+	height:100%;
+/* 	border-color:blue; */
+}
+
+th{
+	font-size:1.1em;
+	text-align:left;
+	color: white;
+	background-color:#106EC7;
+}
+
+tr.segment td{
+	padding-left:50px;
+	color: #106EC7;
+	font-size:1.1em;
+}
+
+td.lib {
+	padding-left:50px;
+	color: #106EC7;
+	font-size:1.1em;
+}
+
+tr.h td {
+	font-style:italic
+}
+
+a:link {
+	font-size:1.1em;
+	text-align:left;
+	color: #106EC7;
+	text-decoration:none;
+	margin-top:50px;
+}
+
+a:visited {
+	font-size:1.1em;float:left;
+	text-align:left;
+	color: #106EC7;
+	text-decoration:none;
+}
+
+a:hover {
+	font-size:1.1em;
+	text-align:left;
+	color: white;
+	background-color:#106EC7;
+	text-decoration:none;
+}
+
+div.runNameContainer {
+	clear:both;
+	float:left;
+	font-family:;
+	width:600px;
+	background-color:white;
+	margin-left:20px;
+}
+
+div.runName {
+/* 	clear:left; */
+	font-family:arial;
+	color:#106EC7;
+	float:left;
+	margin-bottom:5px;
+	margin-left:10px;
+}
+
+div.selectAllRun {margin-left:20px;
+	float:right;
+	margin-right:10px;
+/* 	border:red 1px solid; */
+	display:none;
+}
+
+div.runContainer {
+	float:left;
+	display:none;
+	clear:both;
+	width:596px;
+	border: solid #106EC7 3px;
+	margin-left:20px;
+	margin-bottom:20px;
+/* 	background-color:red; */
+}
+
+div.segmentContainer {
+	float:left;
+	display:none;
+	clear:left;
+/* 	background-color:green; */
+	
+}
+
+div.segmentNameContainer {
+/* 	float:left; */
+	clear:both;
+/* 	border: solid 2px black; */
+}
+
+div.selectAllSegment {
+	float:right;
+	margin-right:10px;
+/* 	border:red 1px solid; */
+/* 	display:none; */
+}
+
+
+div.segmentName {
+	float:left;
+	margin-left:20px;
+/* 	clear:both; */
+/* 	border: solid 2px black; */
+}
+
+
+div.libraryContainer{
+/* 	background-color:blue; */
+/* 	border: solid 1px blue; */
+	margin-left:30px;
+	clear:both;
+}
+
+div.checkbox {
+	clear:left;
+	float:left;
+/* 	width:25px; */
+/* 	background-color:black; */
+}
+
+div.libraryName {
+	float:left;
+/* 	border: solid 2px blue; */
+/* 	width:300px; */
+}
+
+div.ButtonsContainer {
+	margin-top:30px;
+	clear:both;
+}
+
+
+
+input {
+	font-weight: none;
+}
+
+div.fileName {
+	font-weight: normal;
+}
+
+div.bam_container {
+
+}
+
+div.startmappingfloat {
+/* 	position: relative; */
+
+	float:left;
+
+	margin:20px;
+	padding:15px;
+	background: #106EC7;
+	-moz-border-radius: 10px;
+	-webkit-border-radius: 10px;
+	border-radius: 10px;
+
+	-moz-box-shadow: 5px 5px 10px #888;
+	-webkit-box-shadow: 5px 5px 10px #888;
+	box-shadow: 5px 5px 10px #888;
+
+	width:100px;
+}
+
+div.startmapping {
+/* 	position: relative; */
+
+	float:left;
+
+	clear:left;
+
+	margin:20px;
+	padding:15px;
+	background: #106EC7;
+	-moz-border-radius: 10px;
+	-webkit-border-radius: 10px;
+	border-radius: 10px;
+
+	-moz-box-shadow: 5px 5px 10px #888;
+	-webkit-box-shadow: 5px 5px 10px #888;
+	box-shadow: 5px 5px 10px #888;
+
+	width:100px;
+}
+
+div.startmapping:hover {
+/* 	position: relative; */
+
+	background: #106EFF;
+
+/* 	padding:10px; */
+/* 	margin:20px; */
+
+	-moz-box-shadow: 10px 10px 10px #888;
+	-webkit-box-shadow: 10px 10px 10px #888;
+	box-shadow: 10px 10px 10px #888;
+/* 	width:10%; */
+}
+
+div.startmapping a:hover{
+	background: #106EFF;
+}
+
+div.startmappingfloat:hover {
+/* 	position: relative; */
+
+	background: #106EFF;
+
+/* 	padding:10px; */
+/* 	margin:20px; */
+
+	box-shadow: 10px 10px 10px #888;
+/* 	width:10%; */
+}
+
+div.startmappingfloat a:hover{
+	background: #106EFF;
+}
+
+div.otherinfo {
+	clear:both;
+}
+
+div.folder{
+
+	clear:both;
+	float:left;
+	font-family:;
+	width:600px;
+	background-color:white;
+	margin-left:20px;
+
+	font-family:arial;
+	color:#106EC7;
+
+	font-weight: none;
+
+	display:none;
+}
+
+div.folderheader {
+	font-weight: bold;
+/* 	width:100%; */
+/* 	clear:right; */
+/* 	float:left; */
+}
+
+div.startmapping a{
+	color:white;
+}
+
+div.startmappingfloat a{
+	color:white;
+}
+
+div.foldername{
+
+	cursor:pointer;
+/* 	position:relative; */
+	clear:both;
+	float:left;
+	margin-right:10px;
+/* 	float:left; */
+	
+}
+div.selectall {
+
+	cursor:pointer;
+/* 	position:relative; */
+/* 	background:yellow; */
+	float: left;
+	margin-right:10px;
+	font-size:10px;
+
+}
+
+div.folderheadercontainer {
+/* 	border:5px solid red; */
+	clear:both;
+}

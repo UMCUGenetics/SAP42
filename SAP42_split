@@ -1,0 +1,100 @@
+#!/usr/bin/perl -w 
+
+use strict;
+use Getopt::Std;
+
+
+my $pwd = $ENV{"PWD"};
+chomp($pwd);
+
+my $project = $pwd;
+$project =~ s/^.+\///;
+$project =~ s/\///g;
+
+my $csfasta = get_ls_target('csfasta');
+my $quality = get_ls_target('qual');
+
+print "Asuming colorspace fasta file:\t$csfasta\n\n";
+
+print "Asuming colorspace fasta file:\t$quality\n\n";
+
+split_reads();
+
+
+
+sub split_reads {
+	
+	#checks if readsfolder exists
+	if (!-e "$pwd" . "/reads"){
+		system("mkdir -p $pwd/reads");
+		print "Created directory $pwd" . "/reads\n\n";
+	}
+
+
+	chdir("$pwd" . "/reads");
+	
+	print "Calculating splits... in:\t$csfasta\n";
+
+	my $splits = get_splits($csfasta);
+
+	print "Number of splits:\t$splits\n\n";
+
+	my $command = "ionice -c 2 -n 5 /hpc/cog_bioinf/common_scripts/SAP42-HPC/csfastaToFastq -f $csfasta -q $quality -s $splits -e $project";
+
+	print $command . "\n\n";
+
+	system($command);
+	
+	chdir("$pwd");
+}
+
+
+
+sub get_ls_target {
+
+	my $extention = shift;
+	print $extention . "\n\n";
+	my $csfasta = `ls *.$extention`;
+	chomp($csfasta);
+
+# 	print "Probing: $csfasta\n";
+
+	if (-l $csfasta){
+		$csfasta = `ls -l *.$extention`;
+		$csfasta =~ s/^.+\-> //;
+		chomp($csfasta);
+		print $csfasta . "\n\n";
+# 		print "Found symbolic link to $csfasta\n";
+	}else{
+		$csfasta = `ls *.$extention`;
+		chomp($csfasta);
+	}
+	
+	return $csfasta;
+}
+
+sub get_splits {
+	my $csfasta = shift;
+
+	print "ionice -c 2 -n 5 wc -l $csfasta\n\n";
+
+	my $wc = `ionice -c 2 -n 5 wc -l $csfasta`;
+	chomp ($wc);
+
+	if ($wc =~ m/(\d+) /){
+		my $lines = $1;
+		$lines = $lines / 2;
+		$lines = $lines / 1000000;
+		$lines++;
+		$lines = int($lines);
+
+		return $lines;
+	}else{
+		print "Give the number of splits:\t";
+		my $splits = <STDIN>;
+		chomp($splits);
+		print "\n";
+		return $splits;
+	}
+
+}

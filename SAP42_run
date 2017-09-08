@@ -1,0 +1,313 @@
+#!/usr/bin/perl -w
+
+use strict;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $sgeMainSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $samtools;
+my $bwa;
+use POSIX qw(tmpnam);
+
+
+#Read settings from sap42.ini file
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation);
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$sgeMainSettings = $settings->{SGEMAINSETTINGS};
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+	$samtools = $settings->{SAMTOOLS};
+	$bwa = $settings->{BWA};
+}
+
+require config;
+
+my $configurationFile = shift(@ARGV) or die "Supply a configurationfile\n\n";
+
+#Load configurations in $configurations array, typically only 1 configuration file (.conf) is supplied
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+foreach my $configuration (@{$configurations}){
+
+	my $working_directory = $configuration->{PWD}; 	#Working directory
+	my $projectname = $configuration->{NAME};	#lane_libraryname_tag_date
+	my $samplename = $configuration->{LIBRARYNAME};	#libraryname
+	my $GENOME = $configuration->{REFERENCE};	#reference genome
+	my $arguments = $configuration->{ALNARG};	#BWA alignment arguments
+	my $priority = $configuration->{PRIORITY};	#Cluster priority
+	my $email = $configuration->{EMAIL};		#Email address of pipeline user
+
+	my @to_run;					#Array to contain fastq file-names found in workdir/reads
+	my @jobs_to_wait;				#Array to contain job ids that have priority over other job ids (e.g. merged/statistics jobs)
+
+	#Switch to working directory
+	chdir($working_directory); 			
+
+	#Create and run pre-mapping statistics cluster jobs
+	if (exists($configuration->{PRESTATS})){
+		if ($configuration->{PRESTATS} =~ m/y/i){
+	
+			print "perl $scriptRoot/SAP42_statistics --pre $configurationFile\n\n";
+			system("perl $scriptRoot/SAP42_statistics --pre $configurationFile &");
+		}
+	}
+
+	#Switch to working directory
+	chdir($working_directory);
+
+	#Add all fastq filenames found in workdir/reads to @to_run array
+	while (my $f=<reads/*.fastq>) {
+		$f=~s/reads\///;
+		push @to_run, $f;
+	}
+
+	#Convert from local path (usually starting with /data/workdir) to cluster path shared throughout cluster (e.g /home/sge_share_fedor8/workdir)
+	#This will only be done if PATH is given in SAP42.ini file
+	my $workdir = $working_directory; $workdir=~s/\n//;
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$workdir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+	
+	#Create cluster submission script
+	open QSUB,">qsub2.sh";
+	print QSUB "\#!/bin/sh\n\n"; #. $sgeScript\n\n";
+	
+	mkdir "results" unless -e "results";
+	
+	foreach my $p (@to_run) {
+		
+		print "$p\n";
+		
+		my $coreName = $p; $coreName =~ s/\.fastq//;			#fastq name
+		my $sam = "$coreName.sam";					#name of output sam-file
+		my $randomID = get_job_id();					#random id
+		my $job_id = "BWA$p".$randomID;					#random id + BWA identifying it as a mapping job
+		my $tmpFolder = "/tmp/$projectname\_$coreName\_$randomID";	#name of temporary folder on cluster node
+		my $bam = "$coreName.bam";					#name of output bam-file
+		warn "submitting $p\n";
+	
+		open SH,">reads/$job_id.sh";					#Open job shell script
+		print SH "\#!/bin/sh\n\#\$ -S /bin/sh\n\n";			#shell script header
+		#print SH "sleep " . int(rand(20)) . "\n\n\n\n";			#Random sleeping time ????
+		print SH "cd $workdir\n\n";					#Switch to submission node workdirectory
+		print SH "uname -n > results/$p.host\n";			#Write hostname to <fastqname>.host file
+		print SH "date >> results/$p.host\n";				#Write date to <fastqname>.host file
+		print SH "uname -n > results/$p.err\n";				#Write hostname to <fastqname>.err file
+		#print SH "mkdir $tmpFolder \n\n";				#Create temporary data directory on host
+
+
+		if (defined($configuration->{EMAIL})){
+			my $email = $configuration->{EMAIL};
+			print SH "perl $scriptRoot/SAP42_sleep -directory $working_directory -email $email\n\n"; #Check if output directory has >2% diskspace left and send mail
+		}else{
+			print SH "perl $scriptRoot/SAP42_sleep -directory $working_directory\n\n";		#Check if output directory has >2% diskspace left
+		}
+
+		if (!-e "results/$coreName\_sorted.bam"){
+		
+			print "alignment\n";
+			print SH "echo -e \"\\nBWA mapping\" >> results/$p.err\n\n"; 	#Write status to <fastqname>.err file
+			#print SH "cp reads/$p $tmpFolder/\n\n";				#Copy fastq to temp folder on cluster node
+			print SH "$bwa aln $arguments $GENOME reads/$p > results/$p.out 2>> results/$p.err\n\n"; #BWA mapping
+			print SH "date >> results/$p.host\n\n";				#Write date to <fastqname>.host file
+			print SH "echo -e \"\\nSAM\" >> results/$p.err\n\n";		#Write status to <fastqname>.err file
+			#Create sam-file
+			print SH "$bwa samse -r \"\@RG\tID:$projectname\tPL:SOLID\tLB:$samplename\tSM\:$samplename\" $GENOME results/$p.out reads/$p > results/$sam 2>> results/$p.err\n\n";
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";#Write status to <fastqname>.err file
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";		#Write dir-contents of temp to <fastqname>.err file
+		
+			print "Convert to bam\n";
+			print SH "echo -e \"\\nSAM 2 BAM\" >> results/$p.err\n\n";	#Write status to <fastqname>.err file
+	
+
+			my $cmd = join( ' ', "$samtools",
+						'import',
+						"$GENOME.fai",
+						"results/$sam",
+						"results/$bam",
+			);
+	
+			print SH $cmd . " 2>> results/$p.err\n\n";			#Create bam-file and write status to <fastqname>.err file
+	
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";#Write status to <fastqname>.err file
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";		#Write dir-contents of temp to <fastqname>.err file
+
+			print "Sort bam\n";
+			print SH "echo -e \"\\nSort BAM\" >> results/$p.err\n\n";	#Write status to <fastqname>.err file
+	
+			$cmd = join( ' ', "$samtools",
+						'sort',
+						"results/$bam",
+						"results/$coreName\_sorted",
+			);
+			print SH $cmd . " 2>> results/$p.err\n\n";			#Sort bam-file and write status to <fastqname>.err file
+
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";#Write status to <fastqname>.err file
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";		#Write dir-contents of temp to <fastqname>.err file
+			
+		
+			#print SH "cp $tmpFolder/$coreName\_sorted.bam results/ 2>> results/$p.err\n\n"; #Copy sorted bam back to submission host and write status to <fastqname>.err file
+	
+		}else{
+			#print SH "cp results/$sam $tmpFolder/\n\n";					#Copy sam-file to temp
+			#print SH "cp results/$bam $tmpFolder/ 2>> results/$p.err\n\n";			#Copy bam-file to temp
+			warn "Skipping $p\n";
+			next;
+		}
+	
+
+
+		#print SH "rm -rf $tmpFolder/ 2>> results/$p.err\n\n";	#Clean temp directory on cluster node
+		print SH "date >> results/$p.host\n";			#Write date to <fastqname>.host file
+	
+		close SH;						#Close shell script
+	
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$job_id.sh\n"; #Add shell script to qsub list
+		#print QSUB "sleep 1\n\n"; #Wait for a second
+		push @jobs_to_wait, $job_id; #Add job_id to array (see array description at top)
+
+	}
+	
+	my $postAnalysis = "";
+	my $postStatsist = "";
+# 	my $postVariants = "";
+	
+	#$postAnalysis .= "mkdir /tmp/$projectname/ > postAnalysis.log 2> postAnalysis.err \n\n";
+	$postAnalysis .= "perl $scriptRoot/post_merge_bams.pl $projectname > postAnalysis.log 2> postAnalysis.err\n\n";
+	#$postAnalysis .= "cp /tmp/$projectname/$projectname.bam ./ > postAnalysis.log 2> postAnalysis.err\n\n";
+	#$postAnalysis .= "sleep 60 > postAnalysis.log 2> postAnalysis.err\n\n";
+	#$postAnalysis .= "perl $scriptRoot/post_index_bam.pl $projectname.bam > postAnalysis.log 2> postAnalysis.err\n";
+	#$postAnalysis .= "sleep 60 > postAnalysis.log 2> postAnalysis.err\n\n";
+	#$postAnalysis .= "rm -rf /tmp/$projectname/ > postAnalysis.log 2> postAnalysis.err\n";
+
+	
+	if (exists($configuration->{POSTSTATS})){
+		if ($configuration->{POSTSTATS} =~ m/y/i){
+			print "perl $scriptRoot/SAP42_statistics --post $configurationFile > postAnalysis.log 2> postAnalysis.err\n\n";
+			$postStatsist .= "if [ ! -f $workdir/NoGo.err ]\n";
+			$postStatsist .= "then\n";
+			$postStatsist .= "perl $scriptRoot/SAP42_statistics --post $configurationFile > postAnalysis.log 2> postAnalysis.err\n\n";
+			$postStatsist .= "fi\n";
+		}
+	}
+
+###########################################SANDER 12-12-2012########################################
+#prevent variant calling on un-merged libraries, variant calling is later executed through the SAP42_merge_lanes script
+
+# 	if (defined($configuration->{VARIANTSETTINGS})){
+# 		print "perl $scriptRoot/SAP42_run_variants $configurationFile\n\n";
+# 
+# 		$postVariants .= "perl $scriptRoot/SAP42_run_variants $configurationFile > postAnalysis.log 2> postAnalysis.err\n\n";
+# 
+# 	}
+######################################################################################################
+	
+	$postAnalysis .= "perl $scriptRoot/SAP42_check -remove-fastq -cleanup > $workdir/remove.log\n\n";
+
+	$postAnalysis .= "perl $scriptRoot/SAP42_sleep -file $projectname.bam.bai > postAnalysis.log 2> postAnalysis.err \n\n";
+	
+	runCommand("postAnalysis",$postAnalysis, $workdir);
+	runCommand("postStatsist",$postStatsist, $workdir);
+# 	runCommand("postVariants",$postVariants, $workdir);
+	
+	print "\nNumber of jobs submitted: ",scalar(@jobs_to_wait),"\n\n";
+	
+	my $post_analysis_job_id = "postAnalysis" . get_job_id();
+# 	
+# 	if(defined($configuration->{MERGE_LANES})){
+		my @parts = split('/',$configuration->{PWD});
+		my $postAnalysisJobs = join('/', @parts[0..$#parts-2])."/postAnalysisJobs.txt";
+		open(PIDS, ">>$postAnalysisJobs");
+		print PIDS $post_analysis_job_id . "\n";
+		close PIDS;
+# 	}
+
+	my $post_statistics_job_id = '';
+# 	my $post_variants_job_id = "postVariants" . get_job_id();
+
+	my $main_priority = $priority + 1;
+
+	if (scalar(@jobs_to_wait) > 0){
+
+		sleep(2);
+		#carfeul if clusternodes are also submitnodes, otherwise specifiy -l hostname=submitnodes
+		print QSUB "qsub  $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $post_analysis_job_id -sync n -hold_jid " . join(",",@jobs_to_wait) . " $workdir/postAnalysis.sh\n\n";
+
+		if (defined($configuration->{POSTSTATS})){
+			sleep(2);
+			$post_statistics_job_id = "postStatistics" . get_job_id();
+			print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $post_statistics_job_id -sync n -hold_jid " . join(",",@jobs_to_wait, $post_analysis_job_id) . " $workdir/postStatsist.sh\n\n";
+			
+		}
+	}else{
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N postAnalysis $workdir/postAnalysis.sh &\n\n";
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N postStatsist -sync n -hold_jid $post_analysis_job_id $workdir/postStatsist.sh\n\n" if defined($configuration->{POSTSTATS});
+	}
+	
+	push @jobs_to_wait, "$post_analysis_job_id";
+	
+# 	my $clusterDir = "/data/fp/cluster";
+# 	$clusterDir=~s/data/home\/sge_share_fedor23/;
+# 	
+# 	my $clusterJobName = $workdir;
+# 	$clusterJobName =~ s/data//;
+# 	$clusterJobName =~ s/\//_/g;
+# 	$clusterJobName =~ s/^.+fedor23//;
+	
+	close QSUB;
+	
+	system("sh $workdir/qsub2.sh");
+	
+
+
+}
+
+############
+sub get_job_id {
+   my $id = tmpnam(); 
+      $id=~s/\/tmp\/file//;
+   return $id;
+}
+
+############
+  
+sub runCommand {
+
+	my ($name, $command, $workdir) = @_;
+
+	open SH,">$name.sh";
+	print SH "\#!/bin/sh\n\#\$ -S /bin/sh\n\n";
+
+	print SH "\#!/bin/sh\n\n"; #. $sgeScript\n\n";
+
+	#print SH "sleep 60\n\n";
+
+	print SH "cd $workdir\n\n";
+
+	#print SH "sleep 60\n\n";
+
+	print SH "$command\n\n";
+
+	close (SH);
+}

@@ -1,0 +1,519 @@
+#!/usr/bin/perl -w
+use strict;
+
+############################################################################
+                                   #
+# USAGE: SAP42 statistics <config file>
+
+# @ FP Ruzius
+# @ S Boymans
+############################################################################
+use strict;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $sgeMainSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $perlmodules;
+my $dataRoot;
+my $qqstorage;
+my $samtools;
+use POSIX qw(tmpnam);
+
+# use lib $scriptsFolder;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	# change back to projectlocation!
+	unshift(@INC, $settings->{PERLMODULES});
+	$perlmodules = $settings->{PERLMODULES};
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$dataRoot = $settings->{DATAROOT};
+	$sgeMainSettings = $settings->{SGEMAINSETTINGS};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+	$qqstorage = $settings->{QQSTORAGE};
+	$samtools = $settings->{SAMTOOLS};
+}
+
+require config;
+use Getopt::Long;
+
+my $configurationFile = pop(@ARGV) or die "Please supply a configurationfile\n";
+
+print "Trying to use $configurationFile\n";
+
+if (!-e $configurationFile){
+	die "Not a valid configurationfile\n";
+}
+
+my $pre = 0;
+my $post = 0;
+
+
+my $d = 1;
+my $m = 1;
+my $r = 1;
+my $q = 1;
+my $c = 1;
+my $p = 1;
+my $l = 1;
+
+
+my $result = GetOptions("-pre" => \$pre,"-post" => \$post);
+
+if (!($pre xor $post)){
+	die "\nPlease specify:\n\t--pre\tfor premapping\n\t--post\tfor postmapping\n\n";
+}
+
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+foreach my $configuration (@{$configurations}){
+
+	if (not defined($configuration->{RUNNAME})){$configuration->{RUNNAME} = "X"}
+	if (not defined($configuration->{SAMPLENAME})){$configuration->{SAMPLENAME} = "X"}
+	if (not defined($configuration->{LIBRARYNAME})){$configuration->{LIBRARYNAME} = "X"}
+	if (not defined($configuration->{LIBTAG})){$configuration->{LIBTAG} = "X"}
+	if (not defined($configuration->{PROJECT})){$configuration->{PROJECT} = "X"}
+	if (not defined($configuration->{NAME})){$configuration->{NAME} = "X"}
+	if (not defined($configuration->{PLATFORM})){$configuration->{PLATFORM} = "X"}
+
+	if ($pre){
+		if (not defined($configuration->{PRESTATS})){die "No prestatistics in configurationfile\n";}
+		print "Commencing with premapping analysis\n";
+		premappingstats($configuration);
+	}else{
+		if (not defined($configuration->{POSTSTATS})){die "No poststatistics in configurationfile\n";}
+		print "Commencing with postmapping anaysis\n";
+ 		postmappingstats($configuration);
+	}
+}
+
+sub get_job_id {
+   my $id = tmpnam(); 
+      $id=~s/\/tmp\/file//;
+   return $id;
+}
+
+sub premappingstats {
+	my $configuration = shift;
+
+	my $priority = $configuration->{PRIORITY} + 1;
+
+	my $workdir = $configuration->{PWD};
+	chdir($workdir);
+	chomp ($workdir);
+	
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$workdir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+	
+	my $breakpoint = 0;
+	
+	require config;
+
+	my $project = $configuration->{NAME};
+	
+	chdir($workdir);
+	
+	mkdir "reads" unless -e "reads";
+	mkdir "results" unless -e "results";
+	
+	open (QSUB, ">statistics_preanalysis.sh");
+	
+	print QSUB "#!/bin/bash\n\n";
+	my @to_run;
+
+	while (my $f=<reads/*p*.fastq>) {
+		$f=~s/reads\///;
+		push @to_run, $f;
+	}
+	
+	my @jobs_to_wait = ();
+	
+	foreach my $p (@to_run) {
+	
+		print "$p\n";
+	
+		my $coreName = $p;
+		$coreName =~ s/\.fastq//;
+		
+		my $randomID = get_job_id();
+		
+		my $job_id = "PRE$coreName".$randomID;
+	
+		my $remote_workdir = "/tmp/$job_id";
+		$remote_workdir =~ s/\./_/;
+
+
+		push(@jobs_to_wait, $job_id);
+
+		open (QSUBTMP, ">reads/$coreName.sh") or die "Problem creating submission script: $!\n";
+
+		print QSUBTMP "cd $workdir\n\n";
+		print QSUBTMP "uname -n > results/$coreName.host\n";
+		print QSUBTMP "date >> results/$coreName.host\n";
+
+		#print QSUBTMP "mkdir $remote_workdir\n";
+	
+		my $command = "perl $perlmodules/QC/premap_basic.pm ";
+		$command .= "-i $workdir/reads/$p ";
+
+		$command .= "-o $coreName ";
+		$command .= "-d $workdir/results ";
+		$command .= "$perlmodules ";
+
+		print QSUBTMP "$command\n\n";
+	
+		print QSUBTMP "date >> results/$coreName.host\n";
+	
+		#print QSUBTMP "cp $remote_workdir/* $workdir/results/\n\n";
+
+		#print QSUBTMP "rm -rf $remote_workdir/\n\n";
+		
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$coreName.sh\n";
+		#print QSUB "sleep 1\n";
+	}
+	
+	open (PRE, ">$workdir/reads/preanalysis_merge.sh");
+
+# 	my $file = $configuration->{CSFASTA};
+
+	my $run_name = $configuration->{RUNNAME};
+	my $segment_name = $configuration->{SAMPLENAME};
+	my $library_name = $configuration->{LIBRARYNAME};
+	my $libtag = "X";
+
+	if (defined($configuration->{LIBTAG})){
+		$libtag = $configuration->{LIBTAG};
+	}
+
+	print PRE "cd $workdir\n\n";
+	my $command = "$perlmodules/QC/premap_merge.pm ";
+	$command .= "-i $qqstorage/plots ";
+	$command .= "-s $qqstorage/summ ";
+	$command .= "-d $workdir/results ";
+	$command .= "-p $workdir ";
+	$command .= "-R /usr/bin/R ";
+
+	my $id = "$run_name\^$segment_name\^$library_name\^$libtag";
+
+# 	if ($libtag ne "X"){
+# 		$id .= "_$libtag";
+# 	}
+
+	$command .= "--id $id ";
+
+	$command .= " $perlmodules ";
+	
+	print PRE "perl $command       \n\n";
+
+	if ((defined($configuration->{EMAIL}))) { # && ($configuration->{PLATFORM} ne '5500')){
+
+		foreach my $emailAdress (split(',', $configuration->{EMAIL})){
+			
+			my $projectname = $configuration->{PROJECT};
+			
+			my $pdf;
+# 			if ($libtag ne "X")
+# 			{
+			$pdf = join('_', "Pre", $configuration->{RUNNAME}, $configuration->{SAMPLENAME}, $configuration->{LIBRARYNAME}, $configuration->{LIBTAG}) . ".pdf";
+# 			}
+# 			else
+# 			{
+# 				$pdf = join('_', "Pre", $configuration->{RUNNAME}, $configuration->{SAMPLENAME}, $configuration->{LIBRARYNAME}) . ".pdf";	     
+# 			}
+
+
+			#print PRE "sleep 10\n\n";
+			print PRE "perl $scriptRoot/SAP42_email -to $emailAdress -subject 'Starting: Mapping $projectname' -file $configurationFile -attachment $pdf\n\n";
+		}
+
+	}
+
+	my $main_priority = $priority + 1;
+
+	if (scalar(@jobs_to_wait) > 0){
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N SAP42merge -sync n -hold_jid ",join(",",@jobs_to_wait)," $workdir/reads/preanalysis_merge.sh\n\n";
+	}else{
+		print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N SAP42merge $workdir/reads/preanalysis_merge.sh\n\n";
+	}
+
+	#print QSUB "sleep 1\n\n";
+	
+	close(QSUB);
+	
+	#Execute the shizzle
+	system("sh $workdir/statistics_preanalysis.sh &");
+}
+
+sub postmappingstats {
+	my $configuration = shift;
+
+	my $priority = $configuration->{PRIORITY} + 1;
+
+	my $workdir = $configuration->{PWD};
+	chdir($workdir);
+	chomp ($workdir);
+	
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$workdir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+	
+	my $breakpoint = 0;
+	
+	require config;
+	
+	my $bam = $configuration->{NAME} . ".bam";
+	
+	my $project = $bam;
+	$project =~ s/\.bam//i or die "Bam file has no bam extention\n";
+
+	$project = $configuration->{NAME};
+	
+	my $reference = $configuration->{REFERENCE};
+	
+	my $brs = '';
+	if (-e "$reference.brps"){
+		$breakpoint = 1;
+		$brs = ".brps";
+	}
+	
+	chdir($workdir);
+	
+	mkdir "reads" unless -e "reads";
+	mkdir "results" unless -e "results";
+	
+	open (QSUB, ">$workdir/statistics_postanalysis.sh");
+	
+	
+	
+	print "opening " . $reference . "$brs\n";
+	
+	open (FASTA, $reference . $brs);
+	
+	my $design = 0;
+
+	if (defined($configuration->{DESIGN}) and (-e $configuration->{DESIGN} ) ) {
+
+		$design = $configuration->{DESIGN};
+
+		if (defined($pathSubstitute)){
+			foreach my $path (keys %{$pathSubstitute}){
+				if ($design =~ m/^$path/){
+					my $substitute = $pathSubstitute->{$path};
+					$design =~ s/$path/$substitute/;
+					last;
+				}
+			}
+		}
+
+	}else{
+		
+		open (REF, $reference);
+		while(<REF>){
+			chomp;
+			if ($_ =~ m/^>/){
+				
+			}else{
+				$design += length($_);
+			}
+		}
+		close(REF);
+	
+	}
+
+	print "\nUsing $design as design\n\n";
+	
+	my @jobs_to_wait = ();
+	
+	while (<FASTA>){
+		chomp;
+	
+		my $chr = '';
+	
+		if ($_ =~ m/^>(.+)$/){
+			$chr = $1;
+			$chr =~ s/\s.+$//;
+	
+			my $chromosome = $chr;
+			
+			$chr =~ s/[\s:\-\[\]]/_/gi;
+	
+			my @breakpoints = ();
+	
+			if ($breakpoint){
+				my $line = <FASTA>;
+				chomp($line);
+				@breakpoints = split("\t", $line);
+			}
+	
+			shift(@breakpoints);
+	
+			my @regions = ();
+	
+			my $prefReg = 1;
+			foreach my $break (@breakpoints){
+				push(@regions, $chromosome . ':' . $prefReg . '-' . $break);
+				$prefReg = $break-1;
+			}
+	
+			if (!scalar(@regions)){
+				push(@regions, $chromosome);
+			}
+	
+			foreach my $region (@regions){
+	
+				my $cfn = "chr$region";
+				$cfn =~ s/[\|\s:\-\[\]]/_/gi;
+				$region =~ s/\|/\\|/;
+					
+				#print "reads/$cfn.sh\n";
+	
+				my $randomID = get_job_id();
+		
+				my $job_id = "SAP42$cfn".$randomID;
+	
+				push(@jobs_to_wait, $job_id);
+	
+				open (QSUBTMP, ">reads/$cfn.sh") or die "Problem creating submission script: $!\n";
+		
+				my $tmp = "/tmp/" . $project . "_$cfn";
+				print QSUBTMP "#!/bin/bash\n\n";
+				print QSUBTMP "cd $workdir\n\n";
+
+				# BAI check
+				print QSUBTMP "perl $scriptRoot/SAP42_sleep -file $project.bam.bai\n\n";
+				
+
+				print QSUBTMP "uname -n > results/$cfn.host\n";
+				print QSUBTMP "date >> results/$cfn.host\n";
+		
+				#print QSUBTMP "mkdir $tmp\n";
+			
+				my $command = "perl $perlmodules/QC/postmap_basic.pm ";
+				$command .= "-f 100 "; #
+				$command .= "-r $design "; #
+				$command .= "-i $project.bam "; #
+				$command .= "-l $region "; #
+				$command .= "-d $workdir/results "; #
+				$command .= "-o $cfn "; #
+				$command .= "--samtools $samtools ";
+				$command .= "$perlmodules ";
+
+				print QSUBTMP "$command\n\n";
+			
+				print QSUBTMP "date >> results/$cfn.host\n";
+			
+				#print QSUBTMP "cp $tmp/*$cfn* $workdir/results/\n\n";
+
+				#print QSUBTMP "rm -rf $tmp/\n\n";
+				
+				close QSUBTMP;
+				#print $workdir . "\n\n";
+				#print $cfn."\n\n";
+				#print "qsub -p $priority $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$cfn.sh\n\n";
+				system("/opt/sge/bin/linux-x64/qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$cfn.sh");
+				#sleep 1;
+				#print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$cfn.sh\n";
+			}
+			
+			
+		}
+	}
+	
+	open (POST, ">$workdir/reads/postAnalysisMerge.sh");
+	
+# 	my $file = $configuration->{CSFASTA};
+
+	my $run_name = $configuration->{RUNNAME};
+	my $segment_name = $configuration->{SAMPLENAME};
+	my $library_name = $configuration->{LIBRARYNAME};
+	my $libtag = "X";
+
+	if (defined($configuration->{LIBTAG})){
+		$libtag = $configuration->{LIBTAG};
+	}
+
+
+
+	print POST "cd $workdir\n\n";
+	
+	#ies edit
+	print POST "perl $scriptRoot/modules/QC/postmap_clonality.pl -d results/ -o $configuration->{NAME} --samtools $samtools -i $bam\n";
+	
+	
+	my $command = "$perlmodules/QC/postmap_merge.pm ";
+# 	$command .= "-c " if $l;
+
+	$command .= "-i $qqstorage/plots "; #
+	$command .= "-s $qqstorage/summ "; #
+	$command .= "-b $project.bam "; #
+	$command .= "-d $workdir/results "; #
+	$command .= "-p $workdir "; #
+	$command .= "-R /usr/bin/R ";
+
+	my $id = "$run_name\^$segment_name\^$library_name\^$libtag";
+
+# 	if ($libtag ne "X"){
+# 		$id .= "_$libtag";
+# 	}
+
+	$command .= "--id $id "; #
+
+	$command .= "--samtools $samtools "; #
+	#$command .= "--db 'dbi:mysql:quality_control^quality_admin^Pr3P0stS0l1d' ";
+# 	$command .= "-m $mapsetting ";
+	$command .= "$perlmodules ";
+	
+	print POST "perl $command       \n\n";
+	
+	my $main_priority = $priority + 1;
+
+	if ((defined($configuration->{EMAIL}))) { # && ($configuration->{PLATFORM} ne '5500')){
+
+		foreach my $emailAdress (split(',', $configuration->{EMAIL})){
+			
+			my $projectname = $configuration->{PROJECT};
+			
+
+			my $pdf;
+			$pdf = join('_', "Post", $configuration->{RUNNAME}, $configuration->{SAMPLENAME}, $configuration->{LIBRARYNAME}, $configuration->{LIBTAG}) . ".pdf";
+
+			#print POST "sleep 10\n\n";
+			print POST "perl $scriptRoot/SAP42_email -to $emailAdress -subject 'Finished: Mapping $projectname' -file $configurationFile -attachment $pdf\n\n";
+		}
+	}
+	close POST;
+	if (scalar(@jobs_to_wait) > 0){
+		system("/opt/sge/bin/linux-x64/qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N SAP42merge -sync n -hold_jid " . join(",",@jobs_to_wait) . " $workdir/reads/postAnalysisMerge.sh");
+	}else{
+		system("/opt/sge/bin/linux-x64/qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N SAP42merge $workdir/reads/postAnalysis.sh");
+	}
+	
+	close(QSUB);
+}
+

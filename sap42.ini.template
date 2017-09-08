@@ -1,0 +1,33 @@
+#SAP42 configurationfile
+
+#scriptroot is the place where all the scripts are placed
+SCRIPTROOT	/home/sge_share_fedor8/common_scripts/pipeline
+#perlmodules is the path added to @INC (perl) to load common modules
+PERLMODULES	/home/sge_share_fedor8/common_modules
+
+#path to settings.sh in the SGE folder
+SGESCRIPT	/srv/sge/fedor8/common/settings.sh
+#additional settings for the SGE
+SGESETTINGS	-q all.q -P mapping -p 0 -l mem_free=10G -l h_vmem=10G
+
+SGEMAINSETTINGS	-q all.q -P fedor8 -p 0 -l mem_free=10G -l h_vmem=10G
+
+#if path substitution is needed: use the following format
+#PATH	from<space>to
+PATH	/data /home/sge_share_fedor8
+
+#Email settings information
+EMAILADRESS	
+EMAILUSERNAME	
+EMAILPASSWORD	
+
+#path information
+WEBROOT	/srv/www/htdocs/SAP42
+DATAROOT	
+RAWDATAROOT	
+REFERENCEROOT	
+TMPFOLDER	/tmp/
+
+#node information
+WEBNODE	
+SUBMITNODE	

@@ -1,0 +1,779 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Getopt::Std;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $sgeMainSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $tmpFolder;
+my $webnode;
+my $submitnode;
+my $release;
+my $xsq_converter;
+use POSIX qw(tmpnam);
+
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$sgeMainSettings = $settings->{SGEMAINSETTINGS};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+	$tmpFolder = $settings->{TMPFOLDER};
+	$webnode = $settings->{WEBNODE};
+	$submitnode = $settings->{SUBMITNODE};
+	$xsq_converter =  $settings->{PERLMODULES};
+	$settings = settings::loadConfiguration("$projectLocation/version.ini");
+	$release = $settings->{RELEASE};
+	
+}
+# .'/XSQCOnverter/'
+require config;
+
+my $currentNode = `uname -n`;
+chomp($currentNode);
+
+my $force = 0;
+my $verbose = 0;
+my $execute = 0;
+my $chunksize = 1000000;
+my $config = parse_commandline_options();
+
+### FUNCTIONS ##########################
+
+sub parse_commandline_options {
+	my %options;
+	getopts("hHf:p:vr:RsS:e:o:c:q:C:a:A:X:x:EF:", \%options);
+	
+	my $c;
+	$force = 0;
+	$c->{PWD} = $ENV{"PWD"};
+	chomp($c->{PWD});
+
+
+	if (defined($options{'h'}) || defined($options{'H'})){
+		help();
+		exit();
+	}
+
+	if (defined($options{'v'})){
+		print "Running $release\n\n";
+		print "Verbose is on\n\n";
+		$verbose = 1;
+	}
+
+	if (defined($options{'E'})){
+		print "Execute is on\n\n" if $verbose;
+		if ($currentNode ne $submitnode){
+			warn "This node is not the submitnode, execution not permitted!\n\n";
+			sleep 10;
+			#die;
+		}else{
+			warn "This is the submitnode\n\n";
+		}
+		$execute = 1;
+	}
+
+	#pipeline starts from XSQ
+	if (defined($options{'X'})){
+		$c->{cpath} = $options{'X'};
+# 		print 'test'.$c->{cpath} . "\n"; exit;
+		if ($webnode ne $currentNode){
+			print "Copying data from $webnode...\n" if $verbose;
+			system("scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath});
+			print "scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath} . "\n\n";
+		}else{
+			print "Can acces $tmpFolder from this location\n";
+		}
+		
+		if (-e "$tmpFolder/" . $c->{cpath}){
+			print "Configurationfile located: $tmpFolder/" . $c->{cpath} . "\n" if $verbose;
+			my ($configs, $nconf) = read_configuration("$tmpFolder/" . $c->{cpath});
+			my $converted_xsqs = {};
+			my $to_convert = {};
+			my $libsizes = {};
+			my $merge_path = '';
+			my $priority = 0;
+			my $noMerge = 0;
+			#Do xsq = conversion
+			foreach my $config (@{$configs}){
+				my ($libname) = (split("_", $config->{NAME}))[1];
+
+# 				push(@{$to_convert->{$config->{XSQ}}->{'libs'}}, $libname.'_'.$tag);
+				$to_convert->{$config->{XSQ}}->{'libs'}->{$libname} = $libname;
+				$merge_path = $config->{PWD};
+				$to_convert->{$config->{XSQ}}->{'loc'} = $config->{PWD};
+				$to_convert->{$config->{XSQ}}->{'name'} = $config->{XSQ};
+			}
+
+			foreach my $config (@{$configs}){
+				use Data::Dumper;
+				print Dumper($config) . "\n";
+				
+				my $state = 0;
+				if(! exists($converted_xsqs->{$config->{XSQ}})){
+					print $config->{XSQ};
+					#send to cluster?
+					$state = convert_xsq($to_convert->{$config->{XSQ}}, $libsizes, $chunksize, $converted_xsqs);
+				}
+
+				my ($libname,$tag) = (split("_", $config->{NAME}))[1,2]; #get library name and tag from NAME in config file
+				
+				$config->{READS} = $libsizes->{$to_convert->{$config->{XSQ}}->{'name'}}->{$libname.'_'.$tag}; #get number of reads converted xsqs hash
+				$config->{SPLITS} = int($config->{READS} / $chunksize)+1;
+
+				my $subdir = $config->{XSQ}; $subdir=~s/.xsq//; $subdir=~s/\n//;
+				$subdir = (split("\/", $subdir))[-1];
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				$workdir = "$workdir/$subdir/$libname\_$tag";
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration( $config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+				sleep(1);
+			}
+
+			##################launch lane merger##################
+			my $postAnalysisJobs = "$merge_path/postAnalysisJobs.txt";			
+			my @waitList = ();
+			if(-e $postAnalysisJobs){
+				open (WAITLIST, "<$postAnalysisJobs");			
+				while(<WAITLIST>){
+					chomp;
+					print $_ . "\n";
+					push(@waitList, $_);
+				}	
+				close WAITLIST;
+			}
+			if (defined($pathSubstitute)){
+				foreach my $path (keys %{$pathSubstitute}){
+					if ($merge_path =~ m/^$path/){
+						my $substitute = $pathSubstitute->{$path};
+						$merge_path =~ s/$path/$substitute/;
+						last;
+					}
+				}
+			}
+			my $mergeJobId = 'MERGE_LANES'.get_job_id();
+			open (MERGE_SUB, ">$merge_path/merge_lanes.sh") or die "Couldn't create $merge_path/merge_lanes.sh";
+			print MERGE_SUB "\#!/bin/bash\n\#\$ -S /bin/sh\n\n";
+			print MERGE_SUB "\#!/bin/bash\n\n. $sgeScript\n\n";
+			#print MERGE_SUB "sleep 300\n\n";
+			print MERGE_SUB "cd $merge_path\n\n";
+# 			print MERGE_SUB "sleep 60\n\n";
+			print MERGE_SUB "uname -n > merge.host\n";
+			print MERGE_SUB "perl ".$scriptRoot."/SAP42_merge_lanes $merge_path \n\n";
+
+			close MERGE_SUB;
+			sleep(10);
+			
+	 		if(scalar(@waitList)){
+				system("qsub $sgeMainSettings -q short -pe threaded 6 -o $merge_path/qsub.out -e $merge_path/qsub.err -N $mergeJobId -sync n -hold_jid " . join(",",@waitList) . " $merge_path/merge_lanes.sh");
+			}else{
+				system("qsub $sgeMainSettings -q short -pe threaded 6 -o $merge_path/qsub.out -e $merge_path/qsub.err -N $mergeJobId -sync n $merge_path/merge_lanes.sh");
+			}
+
+			die "FINISHED! \n\n" if $verbose;
+			die 1;
+			####################################################
+		}
+		else{
+			my ($configs, $nconf) = read_configuration($options{'X'});
+			my $converted_xsqs = {};
+			my $to_convert = {};
+			my $libsizes = {};
+			my $merge_path = '';
+			my $noMerge = 0;
+			#Do xsq = conversion
+			foreach my $config (@{$configs}){
+				my $libname = (split("_", $config->{NAME}))[1];
+				push(@{$to_convert->{$config->{XSQ}}->{'libs'}}, $libname);
+				$merge_path = $config->{PWD};
+				$to_convert->{$config->{XSQ}}->{'loc'} = $config->{PWD};
+				$to_convert->{$config->{XSQ}}->{'name'} = $config->{XSQ};
+			}
+
+			foreach my $config (@{$configs}){
+				print "Configurationfile located\n" if $verbose;
+				my $state = 0;
+				if(! exists($converted_xsqs->{$config->{XSQ}})){
+					$state = convert_xsq($to_convert->{$config->{XSQ}}, $libsizes, $chunksize, $converted_xsqs);
+				}
+				my ($libname,$tag) = (split("_", $config->{NAME}))[1,2]; #get library name and tag from NAME in config file
+				$config->{READS} = $libsizes->{$to_convert->{$config->{XSQ}}->{'name'}}->{$libname.'_'.$tag}; #get number of reads converted xsqs hash
+				$config->{SPLITS} = int($config->{READS} / $chunksize)+1;
+
+				my $subdir = $config->{XSQ}; $subdir=~s/.xsq//; $subdir=~s/\n//;
+				$subdir = (split("\/", $subdir))[-1];
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				$workdir = "$workdir/$subdir/$libname\_$tag";
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration($config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+				sleep(1);
+			}
+			##################launch lane merger##################
+			my $postAnalysisJobs = "$merge_path/postAnalysisJobs.txt";			
+			my @waitList = ();
+			open (WAITLIST, ">$postAnalysisJobs") or die "Couldn't open $postAnalysisJobs , skipping auto merging\n";			
+			while(<WAITLIST>){
+				chomp;
+				push(@waitList, $_);
+			}	
+			close WAITLIST;
+			
+			if (defined($pathSubstitute)){
+				foreach my $path (keys %{$pathSubstitute}){
+					if ($merge_path =~ m/^$path/){
+						my $substitute = $pathSubstitute->{$path};
+						$merge_path =~ s/$path/$substitute/;
+						last;
+					}
+				}
+			}
+			my $mergeJobId = 'MERGE_LANES'.get_job_id();
+			open (MERGE_SUB, ">$merge_path/merge_lanes.sh") or die "Couldn't create $merge_path/merge_lanes.sh";
+			print MERGE_SUB "\#!/bin/bash\n\#\$ -S /bin/bash\n\n";
+			print MERGE_SUB "\#!/bin/bash\n\n. $sgeScript\n\n";
+			#print MERGE_SUB "sleep 300\n\n";
+			print MERGE_SUB "cd $merge_path\n\n";
+# 			print MERGE_SUB "sleep 60\n\n";
+			print MERGE_SUB "uname -n > merge.host\n";
+			print MERGE_SUB "perl ".$scriptRoot."/SAP42_merge_lanes $merge_path \n\n";
+			close MERGE_SUB;
+
+			sleep(10);
+			if(scalar(@waitList)){
+			    #carefull if cluster nodes are submitnodes, otherwise specify -l hostname= submithost
+				system("qsub $sgeMainSettings -q short -pe threaded 6 -o $merge_path/qsub.out -e $merge_path/qsub.err -N $mergeJobId -sync n -hold_jid " . join(",",@waitList) . " $merge_path/merge_lanes.sh");
+			}else{
+				system("qsub $sgeMainSettings -q short -pe threaded 6 -o $merge_path/qsub.out -e $merge_path/qsub.err -N $mergeJobId $merge_path/merge_lanes.sh");
+			}
+
+			die "FINISHED! \n\n" if $verbose;
+			die 1;
+			####################################################
+		}
+	}
+	
+	#pipeline starts from FASTQ- illumina
+	if (defined($options{'F'})){
+	
+	# to do: 
+	#get library names parsed correctly
+	#get number of reads from (gzipped) fastq file
+	#change mapping steps for illumina
+	#catch paired-end into a single mapping procedure
+	
+	#SAP42 configuration
+	#PLATFORM	illumina
+	#NAME	L001_PoolA_R1_00000000
+	#XSQ	/hpc/cog_bioinf/raw_data//miseq/130103_M01102_0006_000000000-A331C/Data/Intensities/BaseCalls/PoolA_S1_L001_R1_001.fastq.gz
+	#PWD	/hpc/cog_bioinf/data/mapping//
+	#REFERENCE	/hpc/cog_bioinf/GENOMES//human_GATK_GRCh37/GRCh37_gatk.fasta
+	#ALNPROM	BWA
+	#ALNARG	BWA,default
+	#EMAIL	
+	#PRIORITY	0
+	#PRESTATS	yes
+	#POSTSTATS	yes
+
+	
+	
+	
+	
+	
+	
+		$c->{cpath} = $options{'F'};
+# 		print 'test'.$c->{cpath} . "\n"; exit;
+		if ($webnode ne $currentNode){
+			print "Copying data from $webnode...\n" if $verbose;
+			system("scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath});
+			print "scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath} . "\n\n";
+		}else{
+			print "Can acces $tmpFolder from this location\n";
+		}
+		
+		if (-e "$tmpFolder/" . $c->{cpath}){
+			print "Configurationfile located: $tmpFolder/" . $c->{cpath} . "\n" if $verbose;
+			my ($configs, $nconf) = read_configuration("$tmpFolder/" . $c->{cpath});
+			print Dumper($configs);
+			my $converted_xsqs = {};
+			my $to_convert = {};
+			my $libsizes = {};
+			my $merge_path = '';
+
+			foreach my $config (@{$configs}){
+				use Data::Dumper;
+				print Dumper($config) . "\n";
+				
+				my ($libname,$tag) = (split("_", $config->{NAME}))[1,2]; #get library name and tag from NAME in config file
+				
+				print "counting lines of fastq file...\t";
+				my $fq_lines = `gunzip -c $config->{FASTQ} | wc -l`;
+				
+				$config->{READS} = $fq_lines/4; #get number of reads converted xsqs hash
+				$config->{SPLITS} = int($config->{READS} / $chunksize)+1;
+				print "$fq_lines lines = ".$config->{READS}," reads\n";
+				my $subdir = $config->{FASTQ}; $subdir=~s/[.fastq|.fastq.gz|.fq|.fq.gz]//; $subdir=~s/\n//;
+				$subdir = (split("\/", $subdir))[-1];
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				$workdir = "$workdir/$subdir/$libname\_$tag";
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration( $config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+				sleep(1);
+			}
+		}else{
+			my ($configs, $nconf) = read_configuration($options{'X'});
+			my $converted_xsqs = {};
+			my $to_convert = {};
+			my $libsizes = {};
+			my $merge_path = '';
+			
+			foreach my $config (@{$configs}){
+				print "Configurationfile located\n" if $verbose;
+				
+				my ($libname,$tag) = (split("_", $config->{NAME}))[1,2]; #get library name and tag from NAME in config file
+				print "counting lines of fastq file...\t";
+				my $fq_lines = `gunzip -c $config->{FASTQ} | wc -l`;
+				
+				$config->{READS} = $fq_lines/4; #get number of reads converted xsqs hash
+				$config->{SPLITS} = int($config->{READS} / $chunksize)+1;
+				print "$fq_lines lines = ".$config->{READS}," reads\n";
+				my $subdir = $config->{FASTQ}; $subdir=~s/[.fastq|.fastq.gz|.fq|.fq.gz]//; $subdir=~s/\n//;
+				
+				$subdir = (split("\/", $subdir))[-1];
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				$workdir = "$workdir/$subdir/$libname\_$tag";
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration($config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+				sleep(1);
+			}
+			
+			die "FINISHED! \n\n" if $verbose;
+			die 1;
+			####################################################
+		}
+	}
+	
+
+	if (defined($options{'C'})){
+		$c->{cpath} = $options{'C'};
+
+		if ($webnode ne $currentNode){
+			print "Copying data from $webnode...\n" if $verbose;
+			system("scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath});
+			print "scp $webnode:$tmpFolder/" . $c->{cpath} . " $tmpFolder/" . $c->{cpath} . "\n\n";
+		}else{
+			print "Can acces $tmpFolder from this location\n";
+		}
+
+		if (-e "$tmpFolder/" . $c->{cpath}){
+			print "Configurationfile located: $tmpFolder/" . $c->{cpath} . "\n" if $verbose;
+			my ($configs, $nconf) = read_configuration("$tmpFolder/" . $c->{cpath});
+			foreach my $config (@{$configs}){
+				use Data::Dumper;
+				print Dumper($config) . "\n";
+
+# 				print "----------------------------------------------------------------------------\n\n" if $verbose;
+# 				print join("\n", "force: $force", "pwd: $pwd", "project: $project", "csfasta: $csfasta", "qual: $quality", "ref: $reference", "split: $splitReads", "splits: $splits", "email: $email", "alnar: $alnarg", "tool: $alntool") . "\n\n" if $verbose;
+# 				if ($c->{splitReads}){
+				$c->{READS} = split_reads($config);
+# 				}
+# 				print Dumper($config) . "\n";
+
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration( $config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+			}
+
+			die "FINISHED! \n\n" if $verbose;
+			die 1;
+
+		}else{
+			my ($configs, $nconf) = read_configuration($options{'C'});
+			foreach my $config (@{$configs}){
+				print "Configurationfile located\n" if $verbose;
+# 					print join("\n", "force: $force", "pwd: $pwd", "project: $project", "csfasta: $csfasta", "qual: $quality", "ref: $reference", "split: $splitReads", "splits: $splits", "email: $email", "alnar: $alnarg", "tool: $alntool") . "\n\n" if $verbose;
+				if ($c->{splitReads}){
+					$c->{reads} = split_reads($config);
+				}
+
+				my $workdir = $config->{PWD}; $workdir=~s/\n//;
+				if (defined($pathSubstitute)){
+					foreach my $path (keys %{$pathSubstitute}){
+						if ($workdir =~ m/^$path/){
+							my $substitute = $pathSubstitute->{$path};
+							$workdir =~ s/$path/$substitute/;
+							last;
+						}
+					}
+				}
+				$config->{PWD} = $workdir;
+				$config->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+				$config->{RELEASE} = $release;
+				chdir($config->{PWD});
+				my $fileName = config::print_configuration($config, lc($config->{NAME}) . ".conf");
+				config::execute( $execute, $verbose, $fileName, $scriptRoot);
+			}
+		}
+	}
+	
+	if (defined($options{'f'})){
+		print "Force is on\n\n" if $verbose;
+		$force = 1;
+	}
+	
+	if (defined($options{'f'})){
+		$c->{PWD} = $options{'f'};
+		print "Project work path is set to:\t" . $c->{PWD} . "\n\n" if $verbose;
+	}else{
+		print "Asuming working directory:\t", $c->{PWD}, "\n\n" if $verbose;
+	}
+	
+	if (defined($options{'p'})){
+		$c->{PROJECT} = $options{'p'};
+		print "Project name is set to:\t",$c->{PROJECT},"\n\n" if $verbose;
+	}else{
+		$c->{PROJECT} = $c->{PWD};
+		$c->{PROJECT} =~ s/^.+\///;
+		$c->{PROJECT} =~ s/\///g;
+		
+		print "Assuming project name:\t",$c->{PROJECT},"\n\n" if $verbose;
+	}
+	
+	my $reference_list = select_reference();
+
+	if ((defined($options{'r'})) && (not defined($options{'R'}))){
+		$c->{REFERENCE} = $reference_list->{$options{'r'}}->[1];
+		print "Using reference:\t" . $c->{REFERENCE} . " (", $reference_list->{$options{'r'}}->[0], ")\n\n" if $verbose;
+	}elsif (defined($options{'R'})){
+		print_ref_list();
+		print "\n\tSelect your referense:\t";
+		my $selected = <STDIN>;
+		chomp($selected);
+		print "\n";
+		$c->{REFERENCE} = $reference_list->{$selected}->[1];
+		print "Using reference:\t" . $c->{REFERENCE} . " (", $reference_list->{$selected}->[0], ")\n\n" if $verbose;
+
+	}else{
+		$c->{REFERENCE} = $reference_list->{'1'}->[1];
+		print "Using reference:\t" . $c->{REFERENCE} . " (", $reference_list->{'1'}->[0], ")\n\n" if $verbose;
+	}
+	
+	if (defined($options{'C'})){
+		if (defined($options{'c'})){
+			$c->{CSFASTA} = $options{'c'};
+		}else{
+			$c->{CSFASTA} = get_ls_target('csfasta', $c->{PWD});
+			print "Asuming colorspace fasta file:\t" . $c->{CSFASTA} . "\n\n" if $verbose;
+		}
+	
+		if (defined($options{'q'})){
+			$c->{QUAL} = $options{'q'};
+		}else{
+			$c->{QUAL} = get_ls_target('csfasta', $c->{PWD});
+			print "Asuming colorspace fasta file:\t" . $c->{QUAL} . "\n\n" if $verbose;
+		}
+	
+		if (defined($options{'q'})){
+			$c->{QUAL} = $options{'q'};
+		}else{
+			$c->{QUAL} = get_ls_target('qual', $c->{PWD});
+			print "Asuming quality file:\t" . $c->{QUAL} . "\n\n" if $verbose;
+		}
+	}
+	elsif(defined($options{'X'})){
+		if (defined($options{'x'})){
+			$c->{XSQ} = $options{'x'};
+		}else{
+			$c->{XSQ} = get_ls_target('xsq', $c->{PWD});
+			print "Asuming colorspace xsq file:\t" . $c->{XSQ} . "\n\n" if $verbose;
+		}
+	}
+	
+	$c->{splitReads} = "X";
+
+	if (defined($options{'s'})){
+		$c->{splitReads} = 1;
+	}
+
+	$c->{SPLITS} = "X";
+	if (defined($options{'S'})){
+		$c->{SPLITS} = $options{'S'};
+	}
+
+	if (defined($options{'e'})){
+		$c->{EMAIL} = $options{'e'};
+	}
+
+	if (defined($options{'o'})){
+		$c->{outputFolder} = $options{'o'};
+	}
+
+	$c->{alntool} = "BWA";
+	$c->{ALNPROM} = "X";
+	if (defined($options{'A'})){
+		$c->{ALNPROM} = $options{'A'};
+	} 
+
+	$c->{alnarg} = "-c,-l,25,-k,2,-n,10";
+	if (defined($options{'a'})){
+		$c->{ALNARG} = $options{'a'};
+	}
+
+	$c->{RUNNAME} = "X";
+	$c->{SAMPLENAME} = "X";
+	$c->{LIBRARYNAME} = "X";
+
+	chdir($c->{PWD});
+	my $fileName = config::print_configuration( $c, lc($c->{NAME}) . ".conf");
+	return ($c);
+}
+
+sub convert_xsq {
+# convert_xsq($to_convert, $libsizes, $chunksize);
+	my $conv = shift;
+	my $libsizes = shift;
+	my $chunksize = shift;
+	my $converted_xsq = shift;
+# 	print "test\t".$conv . "\n";
+	my $outdir = $conv->{'loc'}; $outdir=~s/\n//;
+	my $subdir = $conv->{'name'}; $subdir=~s/.xsq//; $subdir=~s/\n//;
+	$subdir = (split("\/", $subdir))[-1];
+	system "mkdir -p $outdir/$subdir/";
+	
+	my $conversionLog = "$outdir/XSQConverter.log";
+	open(LOG, ">>$conversionLog") or die "Couldn write to log file $conversionLog\n";
+	print "Converting xsq-file: ".$conv->{'name'}."\n";
+	print LOG "Converting xsq-file: ".$conv->{'name'}."\n";
+	print "Extracting the following libraries: \n";
+	print LOG "Extracting the following libraries: \n";
+	my $convert_command = "java -Xmx10G -Djava.library.path=$xsq_converter/XSQConverter/lib -jar $xsq_converter/XSQConverter/XSQConverterJava.jar -c $chunksize -f bwa -i ".$conv->{'name'}." -o $outdir 1>>$outdir/$subdir/conv_out.log 2>>$outdir/$subdir/conv_err.log ";
+
+	foreach my $lib (keys %{$conv->{'libs'}}){
+		print "\t$lib\n";
+		print LOG "\t$lib\n";
+		$convert_command .= "-l $lib ";
+	}
+	$convert_command .= "1>> $conversionLog 2>> $conversionLog";
+# 	print $convert_command . "\n"; exit;
+	print "Executing conversioncommand: $convert_command\n";
+	print LOG "Executing conversioncommand: $convert_command\n";
+	close LOG;
+	`$convert_command`;
+	
+	open(LOG, ">>$conversionLog") or die "Couldn write to log file $conversionLog\n";
+	print "Looking for convertion metrics file: $outdir/$subdir/conversionMetrics.txt\n";
+	print LOG "Looking for convertion metrics file: $outdir/$subdir/conversionMetrics.txt\n";
+	
+	if (-e "$outdir/$subdir/conversionMetrics.txt"){
+	    open(CM, "<$outdir/$subdir/conversionMetrics.txt") or die "No conversionMetrics file found";
+	    while(<CM>){
+	    	chomp;
+		my ($libname, $size) = split("\t");
+		print "CONVERT_XSQ\t$libname\t$size\n";
+		print LOG "CONVERT_XSQ\t$libname\t$size\n";
+		$libsizes->{$conv->{'name'}}->{$libname} = $size;	
+	    }
+	    close CM;
+	
+	    use Data::Dumper;
+	    print Dumper($libsizes);
+	    print LOG Dumper($libsizes);
+	    $converted_xsq->{$conv->{'name'}} = 1;
+	    return 1;
+	}else{
+	    print "No conversionMetrics file found: check $conversionLog\n";
+	    print LOG "No conversionMetrics file found: check $conversionLog\n";
+	    return 0;
+	}
+	close LOG;    
+	    
+}
+
+sub get_ls_target {
+	my $extention = shift;
+	my $pwd = shift;
+	my $csfasta = `ls *.$extention`;
+	chomp($csfasta);
+
+	die "Not enough input parameters\n\n" unless $csfasta;
+
+	print "Probing: $csfasta\n" if $verbose;
+
+	if (-l $csfasta){
+		$csfasta = `ls -l *.$extention`;
+		$csfasta =~ s/^.+\-> //;
+		print "Found symbolic link to $csfasta\n" if $verbose;
+		chomp($csfasta);
+	}else{
+		$csfasta = `ls *.$extention`;
+		chomp($csfasta);
+		$csfasta = $pwd . '/' . $csfasta;
+	}
+	return $csfasta;
+}
+
+sub get_splits {
+	my $csfasta = shift;
+	print "wc -l $csfasta\n\n" if $verbose;
+	my $count = 0;
+	open (FILE, "<$csfasta");
+	$count += tr/>/>/ while sysread(FILE, $_, 2 ** 16);
+	close FILE;
+
+	if ($count =~ m/\d+/){
+		my $lines = $count;
+		$lines = $lines / 1000000;
+		$lines++;
+		$lines = int($lines);
+		return ($lines, $count);
+	}else{
+		print "Give the number of splits:\t";
+		my $splits = <STDIN>;
+		chomp($splits);
+		print "\n";
+		return ($splits, "X");
+	}
+}
+
+sub select_reference {
+	my $selected = shift;
+	my $reference_list = open_ref_list();
+}
+
+sub open_ref_list {
+	if (!-e "$scriptRoot/references.sap42.list"){
+		die "Please run SAP42 update first!\n\n";
+	}
+
+	open (REF, "<$scriptRoot/references.sap42.list");
+	my $reference;
+
+	while (<REF>){
+		chomp;
+		my @line = split("\t");
+		$reference->{shift(@line)} = \@line;
+	}
+	return $reference;
+}
+
+sub read_configuration {
+	my $configurationFile = shift;
+	print "Reading $configurationFile as configurationfile\n\n" if $verbose;
+	my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+	return ($configurations, $n_configs);
+}
+
+sub split_reads {
+	my $nreads = "X";
+	my $c = shift;
+
+	#checks if readsfolder exists
+	if (!-e $c->{PWD} . "/reads"){
+		system("mkdir -p " . $c->{PWD} . "/reads");
+		print "Created directory " . $c->{PWD} . "/reads\n\n" if $verbose;
+	}
+	chdir($c->{PWD} . "/reads");
+	
+	if (!$c->{SPLITS}){
+		print "Calculating splits... in:\t" . $c->{CSFASTA} . "\n" if $verbose;
+		($c->{SPLITS}, $c->{READS}) = get_splits($c->{CSFASTA});
+	}
+
+	print "Number of splits:\t" . $c->{SPLITS} . "\n\n" if $verbose;
+	my $command = "ionice -c 2 -n 5 $scriptRoot/csfastaToFastq -f " . $c->{CSFASTA} . " -q " . $c->{QUAL} . " -s " . $c->{SPLITS} . " -e " . $c->{NAME};
+
+	if (!$verbose){
+		$command .= " > /dev/null 2> /dev/null";
+	}
+
+	print "$command\n" if $verbose;
+	system($command);
+	chdir($c->{PWD});
+	return $c->{READS};
+}
+
+sub get_job_id {
+   my $id = tmpnam(); 
+      $id=~s/\/tmp\/file//;
+   return $id;
+}

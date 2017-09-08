@@ -1,0 +1,121 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+my $projectLocation;
+my $scriptRoot;
+my $pathSubstitute;
+
+$| = 1;
+
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+}
+
+use Getopt::Long;
+require config;
+
+my $file = '';
+my $directory = '';
+my $email = '';
+
+my $max_wait = 3600;
+
+GetOptions("file=s" => \$file, "directory=s" => \$directory, "email=s" => \$email);
+
+if ($file){
+
+	if (not -s $file){
+		warn "[SAP42_sleep]\t$file does not exists, or has zero bytes, going to sleep\n";
+	}else{
+		warn "[SAP42_sleep]\t$file exists, and is not zero-length\n";
+		exit;
+	}
+	
+	my $wait_time = 0;
+	
+	while (not -s $file){
+		sleep(60);
+		$wait_time += 60;
+	
+		if ($wait_time >= $max_wait){
+			warn "[SAP42_sleep]\tMaximum waiting time has passed, terminating\n";
+			exit;
+		}
+	
+	}
+
+}elsif($directory){
+
+	if (-d $directory){
+
+
+		if (get_disk_usage($directory) >= 98){
+			warn "[SAP42_sleep]\tHard disk is running low on space!\n";
+
+			if ($email){
+
+
+				if (-e "$directory/spacelowemail.lock"){
+					warn "[SAP42_sleep]\tWarning email already sent\n";
+				}else{
+					system("touch $directory/spacelowemail.lock");
+					system("df -kh $directory | perl $scriptRoot/SAP42_email -subject \"Hardisk is running low\" -to $email");
+				}
+			}
+
+		}else{
+			warn "[SAP42_sleep]\tEnough free space\n";
+			exit;
+		}
+
+		my $wait_time = 0;
+
+		while (get_disk_usage($directory) >= 98){
+			sleep 60;
+			$wait_time += 60;
+	
+			if ($wait_time >= $max_wait){
+				warn "[SAP42_sleep]\tMaximum waiting time has passed, terminating\n";
+				exit;
+			}
+	
+
+		}
+
+		warn "[SAP42_sleep]\tEnough free space again!\n";
+
+	}
+	
+}
+
+sub get_disk_usage {
+	my $d = shift;
+
+
+	my $df = `df -kh $d`;
+	chomp($df);
+
+	my @df_lines = split("\n", $df);
+
+	my @info = split(' ', $df_lines[1]);
+
+	$info[4] =~ s/%//;
+
+	return $info[4];
+
+}

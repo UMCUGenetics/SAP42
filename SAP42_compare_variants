@@ -1,0 +1,307 @@
+#!/usr/bin/perl
+use strict;
+
+my $projectLocation;
+my $scriptRoot;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+}
+
+use Getopt::Long;
+
+my $file1 = '';
+my $file2 = '';
+my $help = 0;
+
+my @mutations = qw/A C T G M R W S Y K/;
+
+my $usage = "SAP42 compare_variants
+	-f1	First file with variants
+	-f2	Second file with variants
+	-h 	Help
+";
+
+my $result = GetOptions("f1=s" => \$file1, "f2=s" => \$file2, "h!"=>\$help, "-help!"=>\$help) or die $usage;
+
+die $usage if $help;
+die "Please supply two files (f1, f2)\nSee -h for help\n\n" unless $file1 && $file2;
+die "Please supply two DIFFERENT files (f1, f2)\nSee -h for help\n\n" if $file1 eq $file2;
+
+my %muts;
+
+my $variants = read_first_file();
+
+@mutations = sort{ $a cmp $b } keys(%muts);
+
+my %calls1;
+my %calls2;
+my %calls3;
+my %overlap;
+my %venn;
+
+open(OVERLAP, ">overlap_snps.txt");
+open(UNIQUE, ">unique_snps.txt");
+open(OUT, ">out");
+open(OVEROUT, ">overout");
+
+read_second_file_and_compare();
+
+print "\n\nSUMMARY OF VARIANTS\n\n";
+
+print "Overlap\n\n";
+my $total1 = print_calls(\%overlap);
+
+# print "\n\n", $file1, "\n\n";
+# my $total1 = print_calls(\%calls1);
+
+# print "\n\n", $file2, "\n\n";
+# my $total2 = print_calls(\%calls2);
+
+# if ($total1 > $total2){
+# 
+# 	print "\n\n", $file1, ' - ', $file2, "\n\n"; 
+# 
+# 	print_diff_calls(\%calls1, \%calls2);
+# }else{
+# 
+# 	print "\n\n", $file2, ' - ', $file1, "\n\n"; 
+# 
+# 	print_diff_calls(\%calls2, \%calls1);
+# }
+
+print "\nUnique in $file1\n\n";
+
+print_calls_file($variants);
+
+# {$variants{$chr}->{$pos}
+# foreach my $chr (keys %{$variants}){
+# 	foreach my $pos (keys %{$variants->{$chr}}){
+# 		print $chr,"\t",$pos,"\t",join("\t", @{$variants->{$chr}->{$pos}}), "\n";
+# 	}
+# }
+
+print "\nUnique in $file2\n\n";
+
+print_calls(\%calls3);
+
+open (R, ">R.tmp");
+
+foreach my $val (values(%venn)){
+	print R join("\t", split('',$val)) . "\n";
+}
+
+### FUNCTIONS #######################################################################
+
+sub print_calls {
+	my $callhash = shift();
+
+	print " \t\t", join("\t",'0-10','11-25','26-75','76-90','90-100', 'total') . "\n";
+
+	my $total = 0;
+
+	foreach my $mut (@mutations){
+		print "\t", $mut;
+		my ($r1, $r2, $r3, $r4, $r5, $to) = (0,0,0,0,0,0);
+		foreach my $pnr (keys %{$callhash->{$mut}}){
+			my $c = $callhash->{$mut}->{$pnr};
+			$r1+=$c if ($pnr <= 10);
+			$r2+=$c if ($pnr <= 25 && $pnr > 10);
+			$r3+=$c if ($pnr <= 75 && $pnr > 25);
+			$r4+=$c if ($pnr <= 90 && $pnr > 75);
+			$r5+=$c if (              $pnr > 90);
+			$to+=$c;
+			$total+=$c;
+		}
+		print "\t", join("\t", $r1, $r2, $r3, $r4, $r5, $to) . "\n";
+	}
+	print "\n\t\t\t\t\t\ttotal:\t$total\n";
+	return $total;
+}
+
+sub print_calls_file {
+
+	my $varHash = shift();
+
+	my $callhash;
+
+	foreach my $chr (keys %{$varHash}){
+		foreach my $pos (keys %{$varHash->{$chr}}){
+			my $mut = @{$varHash->{$chr}->{$pos}}[0];
+			my $pnr = @{$varHash->{$chr}->{$pos}}[3];
+			$callhash->{$mut}->{$pnr}++;
+		}
+	}
+
+	print " \t\t", join("\t",'0-10','11-25','26-75','76-90','90-100', 'total') . "\n";
+
+	my $total = 0;
+
+	foreach my $mut (@mutations){
+		print "\t", $mut;
+		my ($r1, $r2, $r3, $r4, $r5, $to) = (0,0,0,0,0,0);
+		foreach my $pnr (keys %{$callhash->{$mut}}){
+			my $c = $callhash->{$mut}->{$pnr};
+			$r1+=$c if ($pnr <= 10);
+			$r2+=$c if ($pnr <= 25 && $pnr > 10);
+			$r3+=$c if ($pnr <= 75 && $pnr > 25);
+			$r4+=$c if ($pnr <= 90 && $pnr > 75);
+			$r5+=$c if (              $pnr > 90);
+			$to+=$c;
+			$total+=$c;
+		}
+		print "\t", join("\t", $r1, $r2, $r3, $r4, $r5, $to) . "\n";
+	}
+	print "\n\t\t\t\t\t\ttotal:\t$total\n";
+	return $total;
+}
+
+sub print_diff_calls {
+	my ($callhash1, $callhash2) = @_;
+
+	print " \t\t", join("\t",'0-10','11-25','26-75','76-90','90-100', 'total') . "\n";
+
+	my $atotal = 0;
+	my $btotal = 0;
+	my $total = 0;
+
+	foreach my $mut (@mutations){
+		print "\t", $mut;
+		my ($ra1, $ra2, $ra3, $ra4, $ra5, $tao) = (0,0,0,0,0,0);
+		my ($rb1, $rb2, $rb3, $rb4, $rb5, $tbo) = (0,0,0,0,0,0);
+		foreach my $pnr (keys %{$callhash1->{$mut}}){
+			my $c = $callhash1->{$mut}->{$pnr};
+			$ra1+=$c if ($pnr <= 10);
+			$ra2+=$c if ($pnr <= 25 && $pnr > 10);
+			$ra3+=$c if ($pnr <= 75 && $pnr > 25);
+			$ra4+=$c if ($pnr <= 90 && $pnr > 75);
+			$ra5+=$c if (              $pnr > 90);
+			$tao+=$c;
+			$atotal+=$c;
+		}
+		foreach my $pnr (keys %{$callhash2->{$mut}}){
+			my $c = $callhash2->{$mut}->{$pnr};
+			$rb1+=$c if ($pnr <= 10);
+			$rb2+=$c if ($pnr <= 25 && $pnr > 10);
+			$rb3+=$c if ($pnr <= 75 && $pnr > 25);
+			$rb4+=$c if ($pnr <= 90 && $pnr > 75);
+			$rb5+=$c if (              $pnr > 90);
+			$tbo+=$c;
+			$btotal+=$c;
+		}
+
+		my ($r1, $r2, $r3, $r4, $r5, $to) = (($ra1-$rb1), ($ra2-$rb2) ,($ra3-$rb3), ($ra4-$rb4), ($ra5-$rb5), ($tao-$tbo));
+		$total += ($atotal - $btotal);
+
+		print "\t", join("\t", $r1, $r2, $r3, $r4, $r5, $to) . "\n";
+	}
+	print "\n\t\t\t\t\t\ttotal:\t$total\n";
+	
+}
+
+sub read_first_file{
+
+	open(FILE1, "<$file1") or die "Can not open file $file1: $!\n\n";
+
+	print "Opening $file1\n\n";
+
+	my %variants;
+
+	my $counter = 0;
+
+	while (<FILE1>){
+		chomp;
+		next if (m/^#/);
+		my ($chr, $pos, $ref, $mut, $coverage, $informcoverage, $medianqual, $pnr, @callcov) = split("\t");
+		push(@{$variants{$chr}->{$pos}}, ($mut, $coverage, $informcoverage, $pnr, @callcov));
+		$counter++;
+
+		$calls1{$mut}->{$pnr}++;
+		$muts{$mut}++;
+
+		$venn{"$chr$pos"} = '10';
+	}
+
+	print "Loaded $counter variants\n\n";
+
+	return \%variants;
+
+}
+
+sub read_second_file_and_compare{
+	
+	my ($notIn1, $notIn2) = (0,0);
+
+	open(FILE2, "<$file2") or die "Can not open file $file2: $!\n\n";
+
+	while (<FILE2>){
+		chomp;
+		next if (m/^#/);
+		my ($chr, $pos, $ref, $mut, $coverage, $informcoverage, $medianqual, $pnr, @callcov) = split("\t");
+
+		$calls2{$mut}->{$pnr}++;
+		$muts{$mut}++;
+
+		if (defined($variants->{$chr}->{$pos})){
+			print OVERLAP "$chr:$pos:$pos:1\n";
+			print OVEROUT "$_\n";
+			compare_call($chr, $pos, $mut, $coverage, $informcoverage, $pnr, @callcov);
+			delete($variants->{$chr}->{$pos});
+			$venn{"$chr$pos"} = '11';
+			$overlap{$mut}->{$pnr}++;
+		}else{
+			print UNIQUE "$chr:$pos:$pos:1\n";
+			print OUT "$_\n";
+			$notIn1++;
+			$calls3{$mut}->{$pnr}++;
+			$venn{"$chr$pos"} = '01';
+		}
+
+	}
+
+}
+
+sub compare_call {
+	my ($chr, $pos, $mut2, $coverage2, $informcoverage2, $pnr2, @callcov2) = @_;
+	my ($mut1, $coverage1, $informcoverage1, $pnr1, @callcov1) = @{$variants->{$chr}->{$pos}};
+
+	my $space = ' ' x length($pos);
+
+	if ($mut1 eq $mut2){
+		
+		if (abs($pnr1 - $pnr2) > abs(25)){
+
+			my @pnrs = sort($pnr1, $pnr2);
+			if ($pnrs[0] <= 50 && $pnrs[1] >= 75){
+
+				print "///\t$chr\t$pos\t$mut1\t$informcoverage1\t$pnr1\t" . join("\t",@callcov1) . "\n";
+				print "   \t  \t$space\t$mut2\t$informcoverage2\t$pnr2\t" . join("\t",@callcov2) . "\n\n";
+
+			}else{
+			
+				print "%\t$chr\t$pos\t$mut1\t$informcoverage1\t$pnr1\t" . join("\t",@callcov1) . "\n";
+				print " \t  \t$space\t$mut2\t$informcoverage2\t$pnr2\t" . join("\t",@callcov2) . "\n\n";
+			}
+		}
+	}else{
+# 		print "$mut1\t$mut2\n$coverage1\t$pnr1\t" . join("\t",@callcov1) . "\n$coverage2\t$pnr2\t" . join("\t",@callcov2) . "\n";
+		print "><\t$chr\t$pos\t$mut1\t$informcoverage1\t$pnr1\t" . join("\t",@callcov1) . "\n";
+		print "  \t  \t$space\t$mut2\t$informcoverage2\t$pnr2\t" . join("\t",@callcov2) . "\n\n";
+	}
+
+}
+
+# sub compare_allele {
+# 	my ($al1, $al2) = @_;
+# 
+# 	my ($ref1, $ref2) = (0,0);
+# 	foreach (split($al1))
+# }
+

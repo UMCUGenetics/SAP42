@@ -1,0 +1,414 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+my $projectLocation;
+my $scriptRoot;
+my $pathSubstitute;
+my $samtools;
+
+$| = 1;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+	$samtools = $settings->{SAMTOOLS};
+
+}
+
+use Getopt::Long;
+require config;
+
+my %pathSub;
+my %revPathSub;
+
+if (defined($pathSubstitute)){
+	%pathSub = %$pathSubstitute;
+	%revPathSub = %pathSub;
+}
+
+my $configurationFile = '';
+my $help = 0;
+my $verbose = 1;
+
+my $changes = 0;
+my $cleanup = 0;
+my $skipcheck = 0;
+my $fixPWD = 0;
+my $removeFastq = 0;
+
+my $backup = '';
+
+my @remove;
+
+my $usage = "SAP42 check [options] [configurationfile]
+";
+
+my $result = GetOptions("backup=s" => \$backup, "cleanup!" => \$cleanup, "fixpwd!" => \$fixPWD, "remove-fastq" => \$removeFastq, "skip-check!" => \$skipcheck, "h!"=>\$help) or die $usage;
+
+die $usage if $help;
+
+
+$configurationFile = get_configurationFile();
+my ($configurations, $n_cofnigs) = config::loadConfiguration($configurationFile);
+
+foreach my $configuration (@{$configurations}){
+	
+	@remove = ();
+
+	checkList($configuration);
+
+	
+	if ($changes){
+# 		config::print_configuration( $configuration->{PWD} . "/" . lc($configuration->{NAME}) . ".conf", $configuration);
+
+		config::print_configuration( $configuration , $configurationFile);
+	}
+
+	if ($cleanup && (scalar(@remove) > 0)){
+		foreach my $file (@remove){
+			
+			print "removing $file " if $verbose;
+			my $out = `rm $file`;
+			chomp($out);
+			print "$out done\n";
+		}
+	}
+
+
+}
+
+sub get_configurationFile {
+
+	#is configurtationfile passed as commandline argument?
+	$configurationFile = $ARGV[$#ARGV];
+	if (defined($configurationFile)){
+		print "Found configurationfile as argument\n" if $verbose;
+		if (-e $configurationFile && $configurationFile =~ m/\.conf/){
+			#found!
+		}else{
+			die "Not a valid configurationfile or file not found\n\n";
+		}
+	}else{
+		print "Looking for configurationfile in current folder\n" if $verbose;
+		if (my $f=<*.conf>) {
+			$configurationFile = $f;
+		}else{
+			die "No configuration file found\n\n";
+		}
+	}
+	print "Using $configurationFile\n\n" if $verbose;
+	return $configurationFile;
+}
+
+sub checkList {
+	my $c = shift;
+
+	if ($fixPWD){
+		$c->{PWD} = $ENV{"PWD"};
+	}
+
+	my $workdir = $c->{PWD};
+
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$c->{PWD} =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+
+	chdir($c->{PWD}) or die "working directory does not exists\n\n";
+
+	#check csfasta
+
+	my $nreads_in_csfasta = 0;
+	my $nreads_in_qual = 0;
+	my $nreads_in_fastq = 0;
+	my $nreads_in_conversionMetrics = 0;
+	my $nreads_in_sams = 0;
+
+	my $nsams = 0;
+	my $nbams = 0;
+	my $nfastqs = 0;
+
+	my $bam_present = 0;
+	my $index_present = 0;
+	my $nreads_in_bam = 0;
+
+	my $bam_files;
+	my $sam_files;
+	my $fastq_files;
+	my $sorted_bam_files;
+
+	if(exists($c->{XSQ})){
+		print "Checking " . $c->{XSQ} . "\n" if $verbose;
+		my @parts = split('/',$c->{PWD});
+		my $conversionMetricsFile = join('/', @parts[0..$#parts-1])."/conversionMetrics.txt";
+		my $libname = $parts[-1];
+		if(-e $conversionMetricsFile){
+			$nreads_in_conversionMetrics = check_conversionMetrics($conversionMetricsFile,$libname);
+		}else{
+			print "Conversion metrics file $conversionMetricsFile does not exist (anymore)\n\n" if $verbose;  
+		}
+
+	}elsif(exists($c->{CSFASTA}) and exists($c->{QUAL})){
+		print "Checking " . $c->{CSFASTA} . "\n" if $verbose;
+		if (-e $c->{CSFASTA}){
+			$nreads_in_csfasta = check_fasta($c->{CSFASTA});
+			print "Found $nreads_in_csfasta reads in the csfasta file\n\n" if $verbose; 
+		}else{
+			print "csfastafile does not exist (anymore)\n\n" if $verbose;  
+		}
+		#check qual
+
+		print "Checking " . $c->{QUAL} . "\n" if $verbose;
+		if (-e $c->{QUAL}){
+			$nreads_in_qual = check_fasta($c->{QUAL});
+			print "Found $nreads_in_qual reads in the quality file\n\n" if $verbose; 
+		}else{
+			print "qualityfile does not exist (anymore)\n\n" if $verbose;  
+		}
+		#check fastq
+
+	}	
+
+
+	my $bamFile = $c->{NAME} . ".bam";
+	my $bam_file_is_okay = 0;
+
+	if (-e $bamFile){
+		$bam_present = 1;
+		print "BAM file found: $bamFile\n" if $verbose;
+		$nreads_in_bam = get_reads_from_bam($bamFile);
+		print "$nreads_in_bam in BAM file\n\n" if $verbose;
+		if (-e "$bamFile.bai"){
+			$index_present = 1;
+			print "BAM-index file found\n\n" if $verbose;
+		}
+
+		if (($nreads_in_bam == $nreads_in_csfasta) || $nreads_in_bam == $nreads_in_conversionMetrics ||($nreads_in_bam == $c->{READS})) {
+			$bam_file_is_okay = 1;
+			print "BAM is OK!\n\n" if $verbose;
+		}else{
+			print "[WARNING] BAM is incomplete!!!!\n\n" if $verbose;
+		}
+
+	}
+
+	if (!$bam_file_is_okay){
+		#does reads folder exists?
+		open (NOGO, ">$workdir/NoGo.err");
+		if (-e 'reads'){
+			my ($counter, $ncorrect, $nreads, $files) = check_splits($c->{SPLITS}, 'reads', '.fastq');
+			print NOGO "Found $counter out of " . $c->{SPLITS} . " chunks\n";
+			print NOGO "$ncorrect chunks where determinded correct\n";
+			print NOGO "$nreads reads where found in all chunks\n\n";
+	
+			$nreads_in_fastq = $nreads;
+			$nfastqs = $ncorrect;
+	
+			$fastq_files = $files;
+		}else{
+			print NOGO "No reads folder\n" if $verbose;
+		}
+	
+		if (-e 'results'){
+	
+			my ($scounter, $sncorrect, $snreads, $sfiles) = check_sam_splits($c->{SPLITS}, 'results', '.sam');
+	
+			print NOGO "Found $scounter out of " . $c->{SPLITS} . " chunks\n";
+			print NOGO "$sncorrect chunks where determinded correct\n";
+			print NOGO "$snreads reads where found in all chunks\n\n";
+	
+			my $sam_files = $sfiles;
+	
+			$nreads_in_sams = $snreads;
+			$nsams = $sncorrect;
+	
+			if ($nsams == $nfastqs) {
+				push(@remove, @{$fastq_files}) if $removeFastq;
+				$removeFastq = 0;
+			}
+	
+			my ($bcounter, $bncorrect, $bnreads, $bfiles) = check_splits($c->{SPLITS}, 'results', '_sorted.bam');
+			print NOGO "Found $bcounter out of " . $c->{SPLITS} . " bam files\n";
+			print NOGO "$bncorrect chunks where determinded correct\n";
+			
+			$nbams = $bncorrect;
+			$sorted_bam_files = $bfiles;
+	
+			if ($nbams == $nsams) {
+				push(@remove, @{$sam_files});
+			}
+	
+		}else{
+			print NOGO "No reads folder\n";
+		}
+		close NOGO;
+	}else{
+		if (-e 'results'){
+			push(@remove, <results/*p*.sam>);
+			push(@remove, <results/*p*bam>);
+			push(@remove, <results/*p*.host>);
+			push(@remove, <results/*p*.err>);
+		}
+		if ((-e 'reads') && ($removeFastq)){
+			push(@remove, <reads/*p*.fastq>);
+		}	
+	}
+
+	if(! exists($c->{XSQ})){
+		if (($nreads_in_csfasta == $nreads_in_qual)){
+			print "All reads are present\n\n" if $verbose;
+			$c->{READS} = $nreads_in_sams if ($nreads_in_sams > 0);
+			$changes++;
+		}
+
+	}
+	
+
+	if (($nsams == $nbams) && ($nfastqs == $nsams) && ($nfastqs == $c->{SPLITS})){
+		print "All chunks are there\n\n" if $verbose;
+	}elsif(($nsams == $nbams) && ($nfastqs == $nsams)){
+		print "Changeing SPLITS in configurationfile\n";
+		$c->{SPLITS} = $nsams if ($nsams > 0);
+		$changes++;
+	}
+
+
+	if ($backup ne ''){
+		$changes++;
+		print "Changeing BACKUP in configurationfile\n";
+		$c->{BACKUP} = $backup;
+	}
+
+}
+
+sub check_fasta {
+	my $f = shift;
+	my $count = 0;
+	open (FILE, "<$f");
+	$count += tr/>/>/ while sysread(FILE, $_, 2 ** 16);
+	return $count;
+}
+
+sub check_conversionMetrics{
+	my ($file, $lib) = @_;
+	my $nrreads = 0;
+	open (FILE, "<$file");
+	while(<FILE>){
+		chomp;
+		my ($l, $s) = split("\t");
+		if(lc($lib) eq lc($l)){
+			$nrreads = $s;
+			last;
+		}
+	}
+	return $nrreads;
+
+}
+
+
+sub get_reads_from_bam {
+	my $bam = shift;
+	my $stats = `$samtools flagstat $bam`;
+	my $fs = $bam;
+	$fs =~ s/bam$//;
+	open OUT ,">$fs"."flagstat" or die "cannot open flagstat out file\n";
+	print OUT $stats;
+	chomp($stats);
+	my @lines = split("\n", $stats);
+
+# 	if ($stats =~ m/(\d+)/){
+# 		return $1;
+# 	}
+	my $line1 = $lines[0];
+	if($line1 =~ m/^(\d+) \+ \d+ in total/){
+	    	    return $1;
+
+	}elsif($line1 =~ m/^(\d+) in total/){
+
+	    return $1;
+	
+	}
+}
+
+sub check_splits {
+	my $splits = shift;
+	my $folder = shift;
+	my $extention = shift;
+	my $countPoint = shift;
+
+	my $counter = 0;
+	my $ncorrect = 0;
+	my $nreads = 0;
+
+	my @files = ();
+
+	while (my $f=<$folder/*p*$extention>) {
+		$counter ++;
+		print "Checking $counter of $splits\r" if $verbose;
+		if (!-z $f){
+			$ncorrect++;
+			my $count = 0;
+			open (FILE, "<$f");
+				$count += tr/\n/\n/ while sysread(FILE, $_, 2 ** 16);
+				$count /= 4;
+			
+			$nreads += $count;
+		}
+		push(@files,$f);
+	}
+	return ($counter, $ncorrect, $nreads, \@files);
+}
+
+sub check_sam_splits {
+	my $splits = shift;
+	my $folder = shift;
+	my $extention = shift;
+	my $countPoint = shift;
+
+	my $counter = 0;
+	my $ncorrect = 0;
+	my $nreads = 0;
+
+	my @files = ();
+
+	while (my $f=<$folder/*p*$extention>) {
+		$counter ++;
+		print "Checking $counter of $splits\r" if $verbose;
+		if (!-z $f){
+			$ncorrect++;
+			my $count = 0;
+
+			$count = `grep -cP '\t.+\t.+\t' $f`;
+
+			chomp($count);
+
+# 			open (FILE, "<$f");
+# 			while (my $l=<FILE>){
+# 				chomp($l);
+# 				my @a = split("\t", $l);
+# 				$count++ if scalar(@a) > 5;
+# 			}
+			
+			$nreads += $count;
+		}
+		push(@files, $f);
+	}
+	return ($counter, $ncorrect, $nreads, \@files);
+}

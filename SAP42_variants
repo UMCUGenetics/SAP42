@@ -1,0 +1,1145 @@
+#!/usr/bin/perl
+use strict;
+# use Number::Format;
+# use IO::Handle;
+my $projectLocation;
+my $scriptRoot;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	#warn join("\n", @INC), "\n";
+}
+
+my $start = time;
+
+use Statistics::Lite qw(:all);
+use Getopt::Long;
+use Number::Format;
+# $| = 1; #disable output buffering
+
+#####################################################################
+#
+#	VERSION 1.4.1	14-02-2011
+#	new: Fixed crucial bug, nr alleles are now correcly used
+#	IMPORTANT: 	snps and indels are now treated seperately
+#			So it is possible to have two calles for one position
+#	i.nijman@hubrecht.eu / f.ruzius@hubrecht.eu
+#
+#
+#
+#####################################################################
+
+my ($pileup_file, $cfn);
+my (%snps, %nr_p, %removals);
+my $rc 			= 'yes';
+my $cl			= 5;
+my $ind_start_sites	= 3;
+my $rlq			= 'yes';
+my $coverage_limit 	= 20;
+my $q_level		= 10;
+my $det_limit 		= 3; 	#only calls appearing more than this are used
+my $str_bal 		= 0.1;	#strand balance percentage, remove SNP if calls are preferentially from one strand only
+my $inf_cov 		= 0;
+my $seed_sup		= 0; # number of calls that need to be present in seeds (usually 25 bp, check mapping settings)
+my $help		= 0;
+my $pnr			= 20;
+my $pr			= 0;
+my $hom			= 75;
+my $max_cov		= 2000;
+my $mna			= 4;
+my $csnps		= 'yes';
+my $cindels		= 'yes';
+my $ouc			= 'no';
+my $muc			= 1;
+my $verbose		= 0;
+# my $fn = Number::Format->new (	-thousands_sep 	=> ',',
+# 				-decimal_digits	=> 2,
+# 				-decimal_fill	=> 'true',
+# );
+
+my %iupac;
+$iupac{'A'}{'C'} = 'M';
+$iupac{'A'}{'G'} = 'R';
+$iupac{'A'}{'T'} = 'W';
+$iupac{'C'}{'G'} = 'S';
+$iupac{'C'}{'T'} = 'Y';
+$iupac{'G'}{'T'} = 'K';
+
+my $usage = "Usage:  SAP42_variants 	
+		-cl clonality level. Remove call if made by -cl times or more on the same read position [$cl]
+		-ss minimum independend start sites. Remove allele if not supported by this number of start sites [$ind_start_sites]
+		-seed number of calls made from read seed that need to be present to allow a call [$seed_sup]
+		-q remove call with quality equal or lower [$q_level]
+		-c coverage needed for position to be considered [$coverage_limit]
+		-mc level of maximum coverage [$max_cov]. These positions will not be considered
+		-d noise level: calls with lower than -d coverage will be removed [$det_limit]
+		-sb strand balance [$str_bal] Enter 0 to disable
+		-pnr only show SNP with %non-ref alleles higher than -pnr [$pnr]
+		-pr When set to higher than zero, will report 'reference' calls in a seperate file [$pr]
+		-mac Maximim number of alleles [$mna]
+		-p pileup file
+		-cfn core_file_name
+		-hom pnr level for homozygous call [$hom]
+		-ouc Use only unique reads [$ouc]
+		-snps yes/no. call snps? [yes]
+		-indels yes/no. call indels? [yes]
+		-h display help\n";
+
+my $result = GetOptions("rc=s" => \$rc, "q=i"=>\$q_level, "ss=i"=>\$ind_start_sites, "c=i"=>\$coverage_limit, "mc=i"=>\$max_cov, "d=i"=>\$det_limit, "cl=i"=>\$cl, "rlq=s"=>\$rlq, "seed=i"=>\$seed_sup, "hom=i"=>\$hom,
+			"pnr=i"=>\$pnr,"pr=i"=>\$pr, "sb=f"=>\$str_bal, "mac=i"=> \$mna, "p=s"=> \$pileup_file, "cfn=s"=>\$cfn, "snps=s"=>\$csnps, "indels=s"=>\$cindels, "ouc=s"=>\$ouc,"h!"=>\$help, "-help!"=>\$help, "-verbose!"=>\$verbose) or die $usage;
+
+die $usage if $help==1; 
+print $usage unless $rc =~ /yes|no/;
+
+open IN, $pileup_file or die "$usage\n\ncannot open pilupfile: $!\n";
+
+die if (($csnps eq 'no') and ($cindels eq 'no'));
+
+my %symmary;
+my %statistics;
+
+$SIG{'INT'} = 'summary_and_die';
+
+#open IN, "maq pileup -Q 150 -vP /home/fedor/GENOMES/rat_rgsc34/rat_full.bfa  merged10.nt.map |" or die "problem infile\n";
+open OUT, ">".$cfn.'.refiltered_snps' or die "cannot open outfile: $!\n" if $csnps eq 'yes';
+open OUT2, ">".$cfn.'.refiltered_reasons' or die "cannot open outfile: $!\n";
+open OUT3, ">".$cfn.'.refiltered_indels' or die "cannot open outfile: $!\n" if $cindels eq 'yes';
+open OUT4, ">".$cfn.'.refiltered_fillins' or die "cannot open outfile: $!\n" if $csnps eq 'yes';
+open OUT5, ">".$cfn.'.refiltered_reference' or die "cannot open outfile: $!\n" if $pr;
+
+my @header = ('#chr', 'pos', 'ref', 'mut', 'oc', 'ic', 'mq', 'pnr', 'call:allele cov');
+
+# autoflush OUT 1
+print OUT "#used settings -cl $cl -ss $ind_start_sites -q $q_level -c $coverage_limit -mc $max_cov -d $det_limit -sb $str_bal -pnr $pnr -hom $hom -ouc $ouc -seed $seed_sup -mac $mna -p $pileup_file -cfn $cfn\n" if $csnps eq 'yes';
+print OUT join("\t", @header)."\n" if $csnps eq 'yes';
+
+print OUT3 "#used settings -cl $cl -ss $ind_start_sites -q $q_level -c $coverage_limit -mc $max_cov -d $det_limit -sb $str_bal -pnr $pnr -hom $hom -ouc $ouc -seed $seed_sup -mac $mna -p $pileup_file -cfn $cfn\n" if $cindels eq 'yes';
+print OUT3 join("\t", @header)."\n" if $cindels;
+
+print OUT4 "#used settings -cl $cl -ss $ind_start_sites -q $q_level -c $coverage_limit -mc $max_cov -d $det_limit -sb $str_bal -pnr $pnr -hom $hom -ouc $ouc -seed $seed_sup -mac $mna -p $pileup_file -cfn $cfn\n" if $cindels eq 'yes';
+print OUT4 join("\t", @header)."\n" if $cindels;
+
+$header[7] = 'pr';
+
+print OUT5 "#used settings -cl $cl -ss $ind_start_sites -q $q_level -c $coverage_limit -mc $max_cov -d $det_limit -sb $str_bal -pr $pr -hom $hom -ouc $ouc -seed $seed_sup -p $pileup_file -cfn $cfn\n" if $pr;
+print OUT5 join("\t", @header)."\n" if $pr;
+
+print OUT2 "#used settings -cl $cl -ss $ind_start_sites -q $q_level -c $coverage_limit -mc $max_cov -d $det_limit -sb $str_bal -pnr $pnr -hom $hom -ouc $ouc -seed $seed_sup -mac $mna -p $pileup_file -cfn $cfn\n";
+print OUT2 join("\t", '#chrom','pos','ref','oc','ic','q','ouc','cl','allele removal') . "\n";
+
+my $snp_counter = 0;
+my $failed_counter = 0;
+my $ref_counter = 0;
+my $allele_counter = 0;
+
+my $calledSnps = 0;
+my $calledIndels = 0;
+my $calledFillins = 0;
+
+#<IN>; # skip header line
+my $c = 0;
+
+SNP: while ( <IN> ) {
+	chomp;
+
+	my ($chr, $pos, $ref, $coverage, $calls, $quals, $readpos, $uniquemapped) = (split("\t", $_))[0,1,2,3,4,5,6,7];
+	
+	next if not defined( ($coverage));
+
+	my ($callsS, $callsI, $callsA) = split_calls($calls);
+
+	call_SNPs('snps', $chr, $pos, $ref, $coverage, $callsA, $quals, $readpos, $uniquemapped) if (($csnps eq 'yes') || ($cindels eq 'yes'));
+
+	if ($verbose){
+
+	$c++;
+
+		if (($c % 1000) == 0){
+			summary(0);
+		}
+	}
+}
+
+print OUT "#END\n";
+print OUT1 "#END\n";
+print OUT2 "#END\n";
+print OUT3 "#END\n";
+print OUT4 "#END\n";
+print OUT5 "#END\n";
+
+summary(1);
+
+############## subs
+sub check_seed_support {
+    my ($alleles, $reasons) = @_;
+    my $c = 0;
+    my $seedlength = 24; # change later to reflect mapping settings
+    my $readlength = 48; # change later to reflect true readlengths used
+    
+    foreach my $allele (keys(%$alleles)) {
+	my $seed_calls = 0;
+	
+	#Edit marlous 01062012
+	if($allele =~ m/\+\-/){
+	    $seed_calls = scalar(@{$alleles->{$allele}});
+	}else{
+	
+	
+	    foreach my $position (@{$alleles->{$allele}}){
+		# $seed_calls++ if ( ($position > 0 ) and ($position >=26) ) or ( ($position < 0 ) and (abs($position) <=26) ); # org FP
+		
+		
+		### If all reads are placed on the F strand, the seed is base 1-25 of a read on the F strand, and (-)26-(-)50 on the R strand.
+		# The above seed_call determinator is incorrect as now the TAIL of a forward reads counts as seed and the TAIL of a reverse reed is taken.
+		
+		
+		
+		# edit ies 171011
+		if ( ( ($position > 0 ) and ($position <= $seedlength) ) or ( ($position < 0 ) and (abs($position) >= ($readlength - $seedlength) ) ) ) {
+		    $seed_calls++ ; 
+		    #print OUT2 "DEBUG SEED DETERMINATOR: $position ==> SEED\n";
+	    	}else{
+	    	    #print OUT2 "\tDEBUG SEED DETERMINATOR: $position ==> NO SEED\n";
+	    	}
+	    }
+	}
+
+	$reasons->{allele}->{$allele}->{seed} = $seed_calls;
+	#remove bad alleles
+
+	if ($seed_calls < $seed_sup){
+		delete($alleles->{$allele});
+	}
+    }
+}
+
+sub remove_allele {
+    while (my $snp = shift) {
+# 	print "removing $snp\n";
+	$inf_cov -= $snps{$snp};
+	delete $snps{$snp};
+    }
+}
+
+sub remove_clonal_calls {
+    my %readpos;
+    my ($readpos,$calls, $quals, $unique, $reasons) = @_;
+    my (@cleaned_calls, @cleaned_quals, @cleaned_pos, @cleaned_unique);
+    my $c = 0;
+    foreach (@$readpos) {
+	#print "check ".$$calls[$c]."\t";
+        if ($readpos{$_}{$$calls[$c]} < $cl){	
+		push (@cleaned_calls, $$calls[$c]);
+		push (@cleaned_quals, $$quals[$c]);
+		push (@cleaned_pos, $$readpos[$c]);
+		push @cleaned_unique, $$unique[$c];
+		$readpos{$_}{ $$calls[$c] }++;
+		#print $readpos{$_}{$$calls[$c]}."\tpassed";
+	}else{
+		$reasons->{call}->{cl}->{$$calls[$c]}++;
+	}
+	    #print "\n";
+        $c++;
+    }
+
+    my $cleaned = ( (scalar @$calls) - (scalar @cleaned_calls) );
+    $inf_cov -= $cleaned;
+    #print "$cleaned calls removed based on clonality ($inf_cov)\n" unless $cleaned == 0;
+    #print join("", sort(@cleaned_calls)),"\n";
+    @$calls = @cleaned_calls;
+    @$quals = @cleaned_quals;
+    @$readpos = @cleaned_pos;
+    @$unique = @cleaned_unique;
+
+    #print "clonal check: calls ", scalar @$calls,"\tquals: ", scalar @$quals, "\tpos: ", scalar @$readpos,"\n";
+    die unless ( ( (@$calls) == ( @$quals))  and ((@$calls) == ( @$readpos)) ) ;
+}
+
+sub remove_low_qual_calls {
+    my ($readpos,$calls, $quals, $unique, $reasons) = @_;
+    my $c = 0;
+    my (@cleaned_calls, @cleaned_quals, @cleaned_pos, @cleaned_unique);
+    foreach (@$quals) {
+	#print $$calls[$c],"\t", $_,"\t", (ord($_)-33),"\n";
+	if($$quals[$c] > $q_level){
+		push @cleaned_calls, $$calls[$c]; 
+		push @cleaned_quals, $$quals[$c];
+		push @cleaned_pos, $$readpos[$c];
+		push @cleaned_unique, $$unique[$c];
+	}else{
+		$reasons->{call}->{'q'}->{$$calls[$c]}++;
+	}
+	$c++;
+    }
+    my $cleaned = ( (scalar @$calls) - (scalar @cleaned_calls) );
+    $inf_cov -= $cleaned;
+    @$calls = @cleaned_calls;
+    @$quals = @cleaned_quals;
+    @$readpos = @cleaned_pos;
+    @$unique = @cleaned_unique;
+    
+    #print "qual check: calls ", scalar @$calls,"\tquals: ", scalar @$quals, "\tpos: ", scalar @$readpos,"\n";
+    #print join("", sort(@cleaned_calls)),"\n";
+    #print "$cleaned calls removed based on q-level ($inf_cov)\t" unless $cleaned == 0;
+    die unless ( ( (@$calls) == ( @$quals))  and ((@$calls) == ( @$readpos)) ) ;
+}
+
+sub noise_level {
+	my ($alleles, $reasons) = @_;
+	foreach ( keys %{$alleles}) {
+		my $c = scalar(@{$alleles->{$_}});
+		$reasons->{allele}->{$_}->{d} = $c;
+		if ($c < $det_limit){
+			delete($alleles->{$_});
+		}
+	}
+}
+
+sub independent_startsites {
+
+	my ($alleles, $reasons) = @_;
+
+	foreach my $allele (keys %{$alleles}){
+		my %startSites = ();
+		foreach my $position (@{$alleles->{$allele}}){
+			$startSites{$position}++;
+		}
+		my $realStartSites = scalar(keys (%startSites));
+		$reasons->{allele}->{$allele}->{ss} = $realStartSites; 
+		
+		if ($realStartSites < $ind_start_sites){
+			delete($alleles->{$allele});
+		}
+	}
+}
+
+sub remove_non_unique_calls {
+    my ($readpos,$calls, $quals, $unique, $reasons) = @_;
+    my $c = 0;
+    my (@cleaned_calls, @cleaned_quals, @cleaned_pos, @cleaned_unique);
+    foreach (@$unique) {
+	#print $$calls[$c],"\t", $_,"\t", (ord($_)-33),"\n";
+	if($_ == 1){
+		push @cleaned_calls, $$calls[$c]; 
+		push @cleaned_quals, $$quals[$c];
+		push @cleaned_pos, $$readpos[$c];
+		push @cleaned_unique, $$unique[$c];
+	}else{
+		$reasons->{call}->{ouc}->{$$calls[$c]}++;
+	}
+
+	$c++;
+    }
+
+    my $cleaned = ( (scalar @$calls) - (scalar @cleaned_calls) );
+    $inf_cov -= $cleaned;
+    @$calls = @cleaned_calls;
+    @$quals = @cleaned_quals;
+    @$readpos = @cleaned_pos;
+    @$unique = @cleaned_unique;
+
+    die unless ( ( (@$calls) == ( @$quals))  and ((@$calls) == ( @$readpos)) ) ;
+}
+
+sub strand_balance {
+    #test presence and balance of non-ref alleles on both strands; otherwise remove snp
+
+	my ($snps, $alleles, $reasons) = @_;
+
+	foreach (keys(%$snps)) {
+
+		if ($str_bal == 0){
+			$reasons->{allele}->{forward_allele($_)}->{sb} = 1;
+		}else{
+
+# 		next unless $str_bal;
+
+		if ( $_ eq forward_allele($_) ) {	#forward allele
+		
+			if (not exists $snps->{ reverse_allele($_) }){
+				delete($alleles->{forward_allele($_)});
+				$reasons->{allele}->{forward_allele($_)}->{sb} = 0;
+				next;
+			}
+
+			#check balance of calls from each strand
+			my $balance = $snps->{$_}/$snps->{ reverse_allele($_) };
+			if (defined($reasons->{allele}->{forward_allele($_)}->{sb})){
+				if ($reasons->{allele}->{forward_allele($_)}->{sb} > $balance){
+					$reasons->{allele}->{forward_allele($_)}->{sb} = $balance;
+				}
+			}else{
+				$reasons->{allele}->{forward_allele($_)}->{sb} = $balance;
+			}
+			if ( ($balance <= $str_bal) or ($balance >= (1/$str_bal) ) ){
+				delete($alleles->{forward_allele($_)});
+			}
+		}else{ #reverse allele
+		
+			if (not exists $snps->{ forward_allele($_) }){
+				delete($alleles->{forward_allele($_)});
+				$reasons->{allele}->{forward_allele($_)}->{sb} = 0;
+				next;
+			}
+
+			#check balance of calls from each strand
+
+			my $balance = $snps{$_}/$snps->{ forward_allele($_) };
+			if (defined($reasons->{allele}->{forward_allele($_)}->{sb})){
+				if ($reasons->{allele}->{forward_allele($_)}->{sb} > $balance){
+					$reasons->{allele}->{forward_allele($_)}->{sb} = $balance;
+				}
+			}else{
+				$reasons->{allele}->{forward_allele($_)}->{sb} = $balance;
+			}
+
+			if ( ($balance <= $str_bal) or ($balance >= (1/$str_bal) ) ){
+				delete($alleles->{forward_allele($_)});
+			}
+		}
+
+		}
+
+
+		if ($reasons->{allele}->{forward_allele($_)}->{sb} > 0.5){
+			$reasons->{allele}->{forward_allele($_)}->{sb} = 1 - $reasons->{allele}->{forward_allele($_)}->{sb};
+		}
+
+	}
+}
+
+sub scoop_maximum_coverage{
+	my ($coverage, $reasons) = @_;
+
+	if ($coverage > $max_cov){
+		$reasons->{check}->{mc} = $coverage;
+		return 0;
+	}
+	return 1;
+}
+
+sub scoop_minimum_coverage{
+	my ($coverage, $reasons) = @_;
+
+	if ($coverage < $coverage_limit){
+		$reasons->{check}->{c} = $coverage;
+		return 0;
+	}
+	return 1;
+}
+
+sub determine_mutant_alleles{
+	my ($alleles, $reasons) = @_;
+
+	my @mut_alleles = ();
+
+	foreach my $allele (sort{ scalar(@{$alleles->{$a}}) <=> scalar(@{$alleles->{$b}}) } keys ( %{$alleles} )){
+		next if ($allele eq '.');
+		next if ($reasons->{allele}->{$allele}->{pnr} < $pnr);
+	
+		push(@mut_alleles, $allele);
+	}
+	return @mut_alleles;
+}
+
+sub check_mutant_alleles {
+	my ($alleles, $reasons, $informativeCoverage) = @_;
+
+	my $number_of_alleles = scalar( keys( %$alleles ) );
+	$number_of_alleles-- if (defined($alleles->{'.'})); #remove reference allele if present
+
+	return $number_of_alleles;
+}
+
+sub to_iupac {
+    my @calls = (sort {lc($a) cmp lc($b) } @_);
+    my $ipuac;
+    if (($calls[0] =~ m/[a-z]/) || ($calls[1] =~ m/[a-z]/)){
+          $ipuac = lc($iupac{ uc($calls[0]) }{ uc($calls[1]) });
+    }else{
+	#return 'N' if scalar @calls >2;
+	#     print $calls[0] . "\t" . $calls[1] . "\n";
+	    $ipuac = $iupac{ $calls[0] }{ $calls[1] };
+    }
+    return $ipuac;
+}
+
+sub call_SNPs {
+
+	my ($mode, $chr, $pos, $ref, $coverage, $calls, $quals, $readpos, $uniquemapped) = @_;
+		%removals=''; #put reason.:50	A:20	s for removal here
+
+	my $valid_call = 1;
+
+# 	if ($coverage == 0){
+# 		return 0;
+# 	}
+	
+	%snps = ();
+	my %reasons = ();
+
+	###################################
+	# Pooperscooper                   #
+	###################################
+
+	if (not scoop_maximum_coverage($coverage, \%reasons)){
+		$valid_call = 0;
+		$symmary{check}{mc}++;
+	}
+
+	if (not scoop_minimum_coverage($coverage, \%reasons)){
+		$valid_call = 0;
+		$symmary{check}{c}++;
+	}
+
+	my @calls = @$calls;
+
+	my @quals = split("", $quals);
+	my @p_q;
+	push @p_q, (ord($_)-33) foreach @quals;
+	@quals = @p_q;
+	my @readpos = split(",", $readpos);
+	#     pop(@readpos); #removes last element from string, which is a whitespace....";
+	my $snp = 0;
+	$inf_cov = $coverage;
+
+	my @unique = split("", $uniquemapped);
+
+	###################################
+	# Call Filtering                  #
+	###################################
+
+	if (($rlq eq 'yes') && $valid_call){
+		remove_low_qual_calls(\@readpos,\@calls, \@quals, \@unique, \%reasons);
+
+		if (scalar(@calls) < 1){
+			$symmary{call}{'q'}++;
+			$valid_call = 0;
+		}
+	}
+
+	if (($ouc eq 'yes') && $valid_call){
+		remove_non_unique_calls(\@readpos,\@calls, \@quals, \@unique, \%reasons);
+		
+		if (scalar(@calls) < 1){
+			$symmary{call}{ouc}++;
+			$valid_call = 0;
+		}
+	}
+
+	if (($rc eq 'yes') && $valid_call){
+		remove_clonal_calls(\@readpos,\@calls, \@quals, \@unique, \%reasons);
+
+		if (scalar(@calls) < 1){
+			$symmary{call}{cl}++;
+			$valid_call = 0;
+		}
+	}
+
+	my $median_q = int(median(@quals)+0.5);
+
+	my $informativeCoverage = 0;
+
+	foreach (@calls){
+		$informativeCoverage++;
+		$snps{$_}++;
+	}
+
+# 	print $informativeCoverage . "\n" . join("\t",@calls) . "\n";
+	
+	###################################
+	# Allele Selection                #
+	###################################
+
+	my %alleles;
+
+	foreach (0..$#calls){
+		if ($calls[$_] eq forward_allele($calls[$_])){
+			push(@{$alleles{ forward_allele($calls[$_]) }}, $readpos[$_]);
+		}else{
+			push(@{$alleles{ forward_allele($calls[$_]) }}, -$readpos[$_]);
+		}
+		
+	}
+
+	strand_balance(\%snps, \%alleles, \%reasons) if $valid_call;
+
+	check_seed_support(\%alleles, \%reasons) if $valid_call;
+
+	$valid_call = 0 if not (scalar(keys(%alleles)));
+
+	noise_level(\%alleles, \%reasons) if $valid_call;
+
+	$valid_call = 0 if not (scalar(keys(%alleles)));
+
+	independent_startsites(\%alleles, \%reasons) if $valid_call;
+
+	$valid_call = 0 if not (scalar(keys(%alleles)));
+
+	###################################
+	# Variant typing                  #
+	###################################
+
+	#determine allele balance and call Variant
+
+	my $inf_snp = 1;
+	my $ref_call = 1;
+
+	my $mut_allele = '';
+	my @mut_alleles = ();
+
+# 	use Data::Dumper;
+# 	print Dumper(\%alleles) . "\n";
+
+	if ($valid_call == 1){
+
+		foreach my $allele (keys(%alleles)){
+			my $mutantAlleleCoverage = scalar(@{$alleles{$allele}});
+			my $percentageNonReference = ((100 / $informativeCoverage) * $mutantAlleleCoverage );
+			$reasons{allele}{$allele}{pnr} = $percentageNonReference;
+		}
+	
+		my $allele_count = check_mutant_alleles(\%alleles, \%reasons, $informativeCoverage);
+		if (($allele_count > $mna) && ($mna =! 0)){
+			foreach (keys(%alleles)){
+				$reasons{check}{$_}{mac} = $mna;
+			}
+			$valid_call = 0;
+			$inf_snp = 0;
+			$ref_call = 0;
+			# too many non reference alleles!
+		}
+	
+		@mut_alleles = determine_mutant_alleles(\%alleles, \%reasons);
+
+		if (scalar(@mut_alleles) && $valid_call){
+			
+		}else{
+			$inf_snp = 0;
+		}
+	
+		if (($pr) && (not $inf_snp)){
+			if ($reasons{allele}{'.'}{pnr} < $pr){
+				$ref_call = 0;
+			}
+		}else{
+			$ref_call = 0;
+		}
+
+	}else{
+		$inf_snp = 0;
+		$ref_call = 0;
+	}
+
+	$valid_call = 0 unless (scalar(keys(%alleles)));
+# 
+	if(($inf_snp == 0) && ($ref_call == 0)) {		#snp did not pass filtering
+		print_to_reasons($chr, $pos, $ref, $coverage, $informativeCoverage, \%reasons);
+		$failed_counter++;
+	}elsif($inf_snp == 1) {	#snp passed filtering -> export
+		$snp_counter++;
+		my $iupac = '';
+
+		foreach my $mut_allele (@mut_alleles){
+
+			#calculate remaining reference allele percentage
+
+			my $total_passed_coverage = 0;
+			my $mutant_passed_coverage = 0;
+			foreach my $allele (keys(%alleles)){
+# 				print "\t" . $allele . "\n";
+				$total_passed_coverage += scalar(@{$alleles{$allele}});
+				if ($allele eq $mut_allele){
+					$mutant_passed_coverage = scalar(@{$alleles{$allele}});
+				}
+			}
+
+			my $remaining_passed_allele_percentage = ((100 / $total_passed_coverage) * $mutant_passed_coverage);
+
+			if (($remaining_passed_allele_percentage <= $hom) and ($mut_allele !~ m/[+\-]/) and (uc($ref) ne "N")){
+				$iupac = to_iupac($ref, $mut_allele);
+			}else{
+				$iupac = $mut_allele;
+			}
+		
+			$iupac =~ s/[\.,]//g;
+		
+			if (uc($ref) eq "N"){
+
+				next if (length($mut_allele) > 1);
+
+				if ($csnps eq 'yes'){
+	
+					$calledFillins++;
+					print OUT4 "$chr\t$pos\t$ref\t$mut_allele\t$coverage\t$informativeCoverage\t$median_q\t". fn($reasons{allele}{$mut_allele}{pnr}, 0),"\t";
+					print OUT4 $_.":".scalar(@{$alleles{$_}})."\t" foreach sort_remaining_alleles(\%alleles, $mut_allele) ;
+					print OUT4 "\n";
+
+					add_to_statistics('fillins',$reasons{allele}{$mut_allele}, 1, $iupac);
+
+					return;
+					# only one allele for fillins is enough!
+				}
+		
+			}elsif ($iupac =~ m/[+\-]/){
+				if ($cindels eq 'yes'){
+					$calledIndels++;
+					print OUT3 "$chr\t$pos\t$ref\t$iupac\t$coverage\t$informativeCoverage\t$median_q\t". fn($reasons{allele}{$mut_allele}{pnr}, 0),"\t";
+					print OUT3 $_.":".scalar(@{$alleles{$_}})."\t" foreach sort_remaining_alleles(\%alleles, $mut_allele);
+					print OUT3 "\n";
+
+					add_to_statistics('indels',$reasons{allele}{$mut_allele}, 1,$iupac);
+				}
+		
+			}else{
+				if ($csnps eq 'yes'){
+					$calledSnps++;
+	
+					print OUT "$chr\t$pos\t$ref\t$iupac\t$coverage\t$informativeCoverage\t$median_q\t". fn($reasons{allele}{$mut_allele}{pnr}, 0),"\t";
+					print OUT $_.":".scalar(@{$alleles{$_}})."\t" foreach sort_remaining_alleles(\%alleles, $mut_allele);
+					print OUT "\n";
+
+					add_to_statistics('snps',$reasons{allele}{$mut_allele}, 1,$iupac);
+				}
+			}
+		}
+
+	}elsif($ref_call == 1){
+		$ref_counter++;
+		if ($csnps eq 'yes'){
+		    #incorporate setting to relate informative coverage to two amounts of an allele, otherwise ref alleles can pass with a very low informative coverage.
+		    #
+		    # [IES]check most stringent determinant (seeds or start sites) and mutliple by two as if it were two copies. Print positions with to litle coverage to reaonsfile
+		    if ( ($informativeCoverage >= (2 * $seed_sup)) and ($informativeCoverage >= (2 *$ind_start_sites)) ) {
+			print OUT5 "$chr\t$pos\t$ref\t$ref\t$coverage\t$informativeCoverage\t$median_q\t". fn($reasons{allele}{'.'}{pnr}, 0) . "\t";
+			print OUT5 $_.":".scalar(@{$alleles{$_}})."\t" foreach sort_remaining_alleles(\%alleles, '.') ;
+			print OUT5 "\n";
+
+			add_to_statistics('reference',$reasons{allele}{'.'}, 1, $ref);
+		    }else{
+			print OUT2 "$chr\t$pos\t$ref\t$coverage\t$informativeCoverage\t failed extra required informative coverage for ref calls\n";
+		    }
+			
+		}
+	}
+}
+
+sub sort_remaining_alleles {
+	my ($alleles, $mut) = @_;
+
+	my %a = %{$alleles};
+	delete($a{$mut});
+
+	return ($mut, keys(%a));
+}
+
+sub split_calls {
+
+	my $calls = shift;
+	my @callA = split("", $calls);
+	my @calls = ();
+	my @snp_calls = ();
+	my @indel_calls = ();
+
+	while (scalar(@callA)){
+		my $call = shift(@callA);
+		if(scalar(@callA)){
+			if ($callA[0] =~ m/([+\-])/){
+				$call .= shift(@callA);
+			}
+			if ($callA[0] =~ m/(\d)/){
+				my $d = shift(@callA);
+				if ($callA[0] =~ m/(\d)/){
+					$d .= shift(@callA);
+				}
+				$call .= $d;
+				foreach (1..$d){
+					$call .= shift(@callA);
+				}
+			}
+		}
+
+		#snp calls
+		push(@snp_calls, substr($call,0,1));
+
+		if (length($call) > 1 ){
+			push(@indel_calls, substr($call,1));
+		}elsif($call =~ m/^[A-Z]$/){
+			push(@indel_calls, '.');
+		}elsif($call =~ m/^[a-z]$/){
+			push(@indel_calls, ',');
+		}else{
+			push(@indel_calls, $call);
+		}
+
+		push(@calls, $call);
+	}
+	return (\@snp_calls, \@indel_calls, \@calls);
+
+}
+
+sub forward_allele {
+	my $a = shift;
+	$a = uc($a);
+	$a =~ s/,/./;
+	return $a;
+}
+
+sub reverse_allele {
+	my $a = shift;
+	$a = lc($a);
+	$a =~ s/\./,/;
+	return $a;
+}
+
+sub print_to_reasons {
+	my ($chr, $pos, $ref, $coverage, $informativeCoverage, $reasons) = @_;
+
+# 	use Data::Dumper;
+# 	print Dumper($reasons) . "\n";
+
+	my $printString = '';
+
+	my $line = 0;
+
+	my @header = ('chr', 'pos', 'ref', 'oc', 'ic', 'setting', 'allele', '#', '|', 'allele', 'sb', 'seed', 'd', 'ss', 'pnr');
+
+	my $c = $reasons->{call};
+	my $a = $reasons->{allele};
+	my $p = $reasons->{check};
+
+	my $fail = '';
+	foreach (('mc', 'c')){
+		if (defined($p->{$_})){
+			$line = 1;
+			$fail = $_;
+		}
+	}
+
+	$printString .= "$chr\t$pos\t$ref";
+
+	if ($line == 1){
+		
+		$printString .= "\t" . 'c ' . $p->{$fail};
+	}else{
+
+		$printString = "$chr\t$pos\t$ref\t$coverage\t$informativeCoverage";
+
+		my @calls = ();
+		my @alleles = ();
+
+		if (scalar((keys(%$c)))){
+
+# 			foreach my $r (keys(%$c)){
+				my $callCounter = 0;
+				foreach my $r ('q', 'ouc', 'cl'){
+					my @ar = ();
+# 					print $r . "\t" . join("\t", (keys(%{$c->{$r}}))) . "\n";
+					foreach my $allele (keys(%{$c->{$r}})) {
+						push(@ar, $allele . ':' . $c->{$r}->{$allele});
+# 						print $r . "\t" . $allele . "\t" . $c->{$r}->{$allele} . "\n";
+					}
+					
+					$printString .= "\t" . join('|', @ar);
+					
+				}
+# 			}
+
+		}else{
+			$printString .= "\t\t\t";
+		}
+
+		foreach my $allele (keys(%$a)){
+			my @ar = ();
+
+			my $delAllele = "$allele";
+			my $failed_reason = '';
+			foreach my $r ('sb','seed', 'd', 'ss', 'pnr'){
+				$delAllele .= "\t";
+				if (defined( $a->{$allele}->{$r})){
+					$delAllele .= fn($a->{$allele}->{$r});
+					$failed_reason = $r;
+
+					push(@ar, fn($a->{$allele}->{$r}));
+				}else{
+					$delAllele .= 'X';
+				}
+			}
+
+			if (defined($reasons->{check}->{$allele}->{mac})){
+				$symmary{check}{mac}++;
+			}else{
+					$allele_counter++;
+					$symmary{allele}{$failed_reason}++;
+			}
+			
+			$printString .= "\t". $allele . ":" . join(',', @ar);	
+# 			print join(',', @ar) . "\n";
+		}
+
+	}
+
+	print OUT2 $printString . "\n";
+}
+
+sub print_to_reasons_old {
+	my ($chr, $pos, $ref, $coverage, $informativeCoverage, $reasons) = @_;
+
+	my $printString = '';
+
+	my $line = 0;
+
+	my @header = ('chr', 'pos', 'ref', 'oc', 'ic', 'setting', 'allele', '#', '|', 'allele', 'sb', 'seed', 'd', 'ss', 'pnr');
+
+	my $c = $reasons->{call};
+	my $a = $reasons->{allele};
+	my $p = $reasons->{check};
+
+	my $fail = '';
+	foreach (('mc', 'c')){
+		if (defined($p->{$_})){
+			$line = 1;
+			$fail = $_;
+		}
+	}
+
+	if ($line == 1){
+		$printString .= "$chr\t$pos\t$ref";
+		$printString .= "\t" . 'Coverage not good ' . $p->{$fail} . "\n";
+	}else{
+
+		my @calls = ();
+		my @alleles = ();
+
+		$printString .= join("\t", @header) . "\n";
+
+		foreach my $allele (keys(%$a)){
+
+			my $delAllele = "$allele";
+			my $failed_reason = '';
+			foreach my $r ('sb','seed', 'd', 'ss', 'pnr'){
+				$delAllele .= "\t";
+				if (defined( $a->{$allele}->{$r})){
+					$delAllele .= fn($a->{$allele}->{$r});
+					$failed_reason = $r;
+				}else{
+					$delAllele .= 'X';
+				}
+			}
+
+			if (defined($reasons->{check}->{$allele}->{mac})){
+				$symmary{check}{mac}++;
+			}else{
+# 				if ((not $pr) && ($allele ne '.')){
+					$allele_counter++;
+					$symmary{allele}{$failed_reason}++;
+# 				}
+			}
+
+			push(@alleles, $delAllele);
+		}
+
+		foreach my $r (keys(%$c)){
+			my $callCounter = 0;
+			foreach my $allele (  sort(keys(%{$c->{$r}}))){
+					my $call = '';
+				if ($callCounter){
+					$call .= " \t$allele\t" . $c->{$r}->{$allele};
+					push(@calls, $call);
+				}else{
+					$call .= "$r\t$allele\t" . $c->{$r}->{$allele};
+					push(@calls, $call);
+				}
+				$callCounter++;
+			}
+		}
+
+		my @m = (scalar(@calls), scalar(@alleles));
+		@m = sort(@m);
+
+		my $max = $m[-1];
+
+		foreach my $counter (0..$max-1){
+			if ($counter){
+				$printString .= " \t \t \t \t ";
+			}else{
+				$printString .= "$chr\t$pos\t$ref\t$coverage\t$informativeCoverage";
+			}
+
+			if ($counter > $#calls){
+				$printString .= "\t \t \t ";
+			}else{
+				$printString .= "\t" . $calls[$counter];
+			}
+
+			if ($counter > $#alleles){
+				$printString .= "\t|";
+			}else{
+				$printString .= "\t|\t" . $alleles[$counter];
+			}
+			$printString .= "\n";
+		}
+
+	}
+
+	$printString .= "-" x 100 . "\n";
+
+	print OUT2 $printString;
+}
+
+sub summary {
+
+	my $flag = shift;
+
+	my $printString = '';
+
+	my $total = ($failed_counter + $calledSnps + $calledIndels + $calledFillins + $ref_counter);
+
+# 	system('clear');
+	print "\n";
+
+	$printString .= "Total\t$total\n\n";
+
+	$printString .= "SNPs\t$calledSnps\t" . fn(percentage($total, $calledSnps)) . "%\n";
+	$printString .= "Indels\t$calledIndels\t" . fn(percentage($total, $calledIndels)) . "%\n";
+	$printString .= "Fillins\t$calledFillins\t" . fn(percentage($total, $calledFillins)) . "%\n";
+
+	if ($pr){
+		$printString .= "Ref\t$ref_counter\t" . fn(percentage($total, $ref_counter))  . "%\n";
+	}
+	$printString .= "Failed\t$failed_counter\t" . fn(percentage($total, $failed_counter))  . "%\n";
+
+	$printString .= "\nScooper\n";
+	foreach my $c (keys(%{$symmary{check}})){
+		$printString .= $c . "\t" . $symmary{check}{$c} . "\t" . fn(percentage($failed_counter, $symmary{check}{$c}),0)  . "%\n";
+	}
+
+	$printString .= "\nCall Filtering\n";
+	foreach my $c (keys(%{$symmary{call}})){
+		$printString .= $c . "\t" . $symmary{call}{$c} . "\t" . fn(percentage($allele_counter, $symmary{call}{$c}),0)  . "%\n";
+	}
+
+	$printString .= "\nAllele Selection\n";
+	foreach my $a (keys(%{$symmary{allele}})){
+		$printString .= $a . "\t" . $symmary{allele}{$a} . "\t" . fn(percentage($failed_counter, $symmary{allele}{$a}),0)  . "%\n";
+	}
+
+	my $now = time - $start;
+
+	$printString .= "\n\nTime\t" . int($now / 3600) . ':' . int(($now % 3600) / 60) . ':' . int($now % 60) . "\n\n\n";
+
+	if ($calledSnps){
+		foreach my $k (keys(%{$statistics{snps}})){
+			my @a = ();
+			foreach my $n (keys(%{$statistics{snps}{$k}})){
+# 				foreach (1..$statistics{snp}{$k}{$n}){
+					push(@a, "$n^" . $statistics{snps}{$k}{$n});
+# 				}
+			}
+			$printString .= "snps\t$k\t" . join(',', @a) . "\n";
+		}
+	}
+
+	if ($calledIndels){
+		foreach my $k (keys(%{$statistics{indels}})){
+			my @a = ();
+			foreach my $n (keys(%{$statistics{indels}{$k}})){
+# 				foreach (1..$statistics{snp}{$k}{$n}){
+					push(@a, "$n^" . $statistics{indels}{$k}{$n});
+# 				}
+			}
+			$printString .= "indels\t$k\t" . join(',', @a) . "\n";
+		}
+	}
+
+	if ($calledFillins){
+		foreach my $k (keys(%{$statistics{fillins}})){
+			my @a = ();
+			foreach my $n (keys(%{$statistics{fillins}{$k}})){
+# 				foreach (1..$statistics{snp}{$k}{$n}){
+					push(@a, "$n^" . $statistics{fillins}{$k}{$n});
+# 				}
+			}
+			$printString .= "fillins\t$k\t" . join(',', @a) . "\n";
+		}
+	}
+
+	if ($ref_counter){
+		foreach my $k (keys(%{$statistics{reference}})){
+			my @a = ();
+			foreach my $n (keys(%{$statistics{reference}{$k}})){
+# 				foreach (1..$statistics{snp}{$k}{$n}){
+					push(@a, "$n^" . $statistics{reference}{$k}{$n});
+# 				}
+			}
+			$printString .= "reference\t$k\t" . join(',', @a) . "\n";
+		}
+	}
+
+	foreach my $t (keys(%{$statistics{count}})){
+		foreach my $mut (keys(%{$statistics{count}{$t}})){
+			$printString .= "count\t$t\t$mut\t" . $statistics{count}{$t}{$mut} . "\n";
+		}
+	}
+
+
+	if ($flag){
+		open (SUM, ">$cfn.refiltered_summary"); 
+		print SUM $printString . "\n";
+		close(SUM);
+	}
+	print $printString . "\n";
+	
+}
+
+sub summary_and_die {
+	summary(0);
+	exit 1;
+}
+
+sub add_to_statistics{
+	my $t = shift;
+	my $h = shift;
+	my $m = shift;
+	my $mut = shift;
+# 	use Data::Dumper;
+# 	print Dumper($h) . "\n";
+
+	foreach my $k (keys(%$h)){
+
+		if ($k eq 'sb'){
+			$statistics{$t}{$k}{ fn($h->{$k},2) }++;
+# 			exit if (fn($h->{$k},2) == 0);
+		}else{
+			$statistics{$t}{$k}{ fn($h->{$k},0) }++;
+		}
+	}
+
+	$statistics{count}{$t}{$mut}++;
+
+# 	print Dumper(\%statistics) . "\n";
+}
+
+sub percentage {
+	@_ = sort{$a <=> $b}@_;
+
+	return 0 if $_[1] == 0;
+
+	return ((100 / $_[1]) * $_[0]);
+}
+
+sub fn {
+	my $n = shift;
+	my $r = 2;
+	if (scalar(@_)){
+		$r = shift;
+	}
+	return Number::Format::round($n, $r);
+}

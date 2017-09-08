@@ -1,0 +1,320 @@
+#!/usr/bin/perl -w
+use strict;
+
+############################################################################
+#                                                                          #
+#         Run Pileup on Cluster + snpcaller                                #
+#     -----------------------------------------------                      #
+#         Frans-Paul Ruzius / Ies Nijman                                   #
+#         May 31 2010   (20100531)                                         #
+############################################################################
+use strict;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $sgeMainSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $tmpFolder;
+my $webnode;
+my $submitnode;
+my $release;
+my $samtools;
+my $ensemblHost;
+my $ensemblUser;
+my $ensemblPassword;
+use POSIX qw(tmpnam);
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$sgeMainSettings = $settings->{SGEMAINSETTINGS};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+	$tmpFolder = $settings->{TMPFOLDER};
+	$webnode = $settings->{WEBNODE};
+	$submitnode = $settings->{SUBMITNODE};
+	$release = $settings->{RELEASE};
+	$samtools = $settings->{SAMTOOLS};
+	$ensemblHost = $settings->{ENSEMBLHOST};
+	$ensemblUser = $settings->{ENSEMBLUSER};
+}
+
+require config;
+
+my $currentNode = `uname -n`;
+chomp($currentNode);
+
+my $configurationFile = pop(@ARGV) or die "Please supply a configurationfile\n";
+
+# IS THIS NODE THE WEBNODE?
+if ($webnode ne $currentNode){
+	print "Copying data from $webnode...\n";
+	system("scp $webnode:" . $configurationFile . " " . $configurationFile);
+}else{
+	print "Can acces $tmpFolder from this location\n";
+}
+
+if (!-e $configurationFile){
+	die "Not a valid configurationfile\n";
+}
+
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+print join("\n", @{$configurations}) . "\n";
+
+foreach my $configuration (@{$configurations}){
+
+	$configuration->{SUBVERSION} = config::get_svn_revision($scriptRoot);
+	$configuration->{RELEASE} = $release;
+
+	my $confFileName = copy_configuration($configuration);
+	variant_caller($configuration, $confFileName);
+}
+
+
+sub copy_configuration{
+	my $c = shift;
+
+	my $confFileName = $c->{PWD} . '/' . lc($c->{NAME}) . '_variants.conf';
+
+	config::print_configuration($c, $confFileName);
+
+	return $confFileName;
+}
+
+sub variant_caller {
+	my $c = shift;
+	my $confFileName = shift;
+
+	my $workdir = $c->{PWD};
+	chomp ($workdir);
+	
+	my @jobs_to_wait = ();
+	
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$workdir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+	
+	my $breakpoint = 0;
+	
+	my $project = $c->{NAME};
+	my $bam = $c->{NAME} . ".bam";
+	
+	my $reference = $c->{REFERENCE};
+
+	my $priority = $c->{PRIORITY};
+	
+	my $species = $c->{VARIANTSPECIES};
+	warn "species $species used\n";
+
+	my $brs = '';
+	if (-e "$reference.brps"){
+		$breakpoint = 1;
+		$brs = ".brps";
+	}
+	
+	chdir($workdir);
+	
+	mkdir "reads" unless -e "reads";
+	mkdir "results" unless -e "results";
+	
+	open (QSUB, ">pileupQsub.sh");
+	
+	print "opening " . $reference . "$brs\n";
+	open (FASTA, $reference . $brs);
+	
+	while (<FASTA>){
+		chomp;
+	
+		my $chr = '';
+	
+		if ($_ =~ m/^>(.+)$/){
+			$chr = $1;
+			$chr =~ s/\s.+$//;
+	
+			my $chromosome = $chr;
+			
+			$chr =~ s/[\s:\-\[\]]/_/gi;
+	
+			my @breakpoints = ();
+	
+			if ($breakpoint){
+				my $line = <FASTA>;
+				chomp($line);
+				@breakpoints = split("\t", $line);
+			}
+	
+			shift(@breakpoints);
+	
+			my @regions = ();
+	
+			my $prefReg = 1;
+			foreach my $break (@breakpoints){
+				push(@regions, $chromosome . ':' . $prefReg . '-' . $break);
+				$prefReg = $break-1;
+			}
+	
+			if (!scalar(@regions)){
+				push(@regions, $chromosome);
+			}
+	
+			foreach my $region (@regions){
+	
+				my $cfn = "chr$region";
+				$cfn =~ s/[\s:\-\[\]]/_/gi;
+	
+				print "reads/$cfn.sh\n";
+	
+				open (QSUBTMP, ">reads/var_$cfn.sh") or die "Problem creating submission script: $!\n";
+		
+				#my $tmp = "/tmp/" . $project . "_$cfn";
+		
+				print QSUBTMP "cd $workdir\n\n";
+
+				my $errorFile = "$cfn\_variants.err";
+
+				print QSUBTMP "touch results/$errorFile\n\n";
+
+				print QSUBTMP "uname -n >> results/$errorFile\n";
+
+				if (defined($c->{EMAIL})){
+					my $email = $c->{EMAIL};
+					print QSUBTMP "perl $scriptRoot/SAP42_sleep -directory $workdir -email $email 2>> results/$errorFile\n\n";
+				}else{
+					print QSUBTMP "perl $scriptRoot/SAP42_sleep -directory $workdir 2>> results/$errorFile\n\n";
+				}
+
+				# BAI check
+				print QSUBTMP "perl $scriptRoot/SAP42_sleep -file $project.bam.bai 2>> results/$errorFile\n\n";
+				print QSUBTMP "uname -n > results/$cfn.host\n";
+				print QSUBTMP "date >> results/$cfn.host\n";
+		
+				#print QSUBTMP "mkdir $tmp\n";
+
+				#check if pileup is already there
+		
+				if ((lc($c->{VARIANTFORCE}) eq 'yes') || (not -e "results/$cfn.pileup")){
+
+					print QSUBTMP "echo -e \"\\nPILEUP\" >> results/$errorFile\n\n";
+			
+					if (lc($c->{FULLPILEUP}) eq 'yes'){
+						print QSUBTMP "perl $scriptRoot/SAP42_pileup -samtools $samtools -all -ref $reference -bam $project.bam -region $region -out results/$cfn.pileup\n\n";
+					}elsif (lc($c->{FULLPILEUP}) eq 'normal'){
+						print QSUBTMP "perl $scriptRoot/SAP42_pileup -samtools $samtools -ref $reference -bam $project.bam -region $region -out results/$cfn.pileup\n\n";
+					}else{
+						print QSUBTMP "perl $scriptRoot/SAP42_pileup -samtools $samtools -onlyvar -ref $reference -bam $project.bam -region $region -out results/$cfn.pileup\n\n";
+					}
+
+					print QSUBTMP "date >> results/$cfn.host\n";
+					#print QSUBTMP "cp $tmp/$cfn.pileup $workdir/results/\n\n" if (lc($c->{PILEUP}) eq 'yes');
+					#print QSUBTMP "ls -la $tmp >> $errorFile\n\n";
+
+				}else{
+					#print QSUBTMP "cp $workdir/results/$cfn.pileup $tmp/\n\n";
+				}
+				#check if SNP file is already there
+				if ((lc($c->{VARIANTFORCE}) eq 'yes') || (not -e "results/$cfn.refiltered_snps") || (not -e "results/$cfn.refiltered_indels")){
+		
+					print QSUBTMP "echo -e \"\\nVARIANT CALLING\" >> results/$errorFile\n\n";
+
+					my $spnSettings = lc($c->{VARIANTSETTINGS});
+					print QSUBTMP "cd $workdir/results\n";
+					print QSUBTMP "perl $scriptRoot/SAP42_variants -p $cfn.pileup -cfn $cfn $spnSettings 2>> $errorFile\n";
+				}
+				
+				if (  lc($c->{VARIANTEFFECTS}) eq 'yes' ){
+					print QSUBTMP "cd $workdir/results\n";
+					print QSUBTMP "echo -e \"\\nEFFECTS\" >> $errorFile\n\n";
+				
+					if (!$ensemblHost){
+						print QSUBTMP "perl $scriptRoot/annotator.pl -species $species -in $cfn.refiltered_snps -out $cfn 2>> $errorFile\n";
+						print QSUBTMP "perl $scriptRoot/annotator.pl -species $species -in $cfn.refiltered_indels -out $cfn 2>> $errorFile\n";
+					}else{
+						print QSUBTMP "perl $scriptRoot/annotator.pl -host $ensemblHost -user $ensemblUser -species $species -in $cfn.refiltered_snps -out $cfn 2>> $errorFile\n";
+						print QSUBTMP "perl $scriptRoot/annotator.pl -host $ensemblHost -user $ensemblUser -species $species -in $cfn.refiltered_indels -out $cfn 2>> $errorFile\n";
+					}
+				}else{
+					print QSUBTMP "#NO EFFECTS\n\n";
+				}
+				
+				print QSUBTMP "cd $workdir\n";
+				print QSUBTMP "date >> results/$cfn.host\n";
+		
+				close(QSUBTMP);
+		
+				if (  lc($c->{VARIANTEFFECTS}) eq 'yes' ){
+				    print QSUB "/opt/sge/bin/linux-x64/qsub  -l cog_bioinf_mysql=1 $sgeMainSettings -q short -o $workdir/qsub.out -e $workdir/qsub.err -N p$cfn\_" . $project . " $workdir/reads/var_$cfn.sh\n";
+				}else{
+				    print QSUB "/opt/sge/bin/linux-x64/qsub $sgeMainSettings -q short -o $workdir/qsub.out -e $workdir/qsub.err -N p$cfn\_" . $project . " $workdir/reads/var_$cfn.sh\n";
+				}
+		
+		
+		
+				print "submitting chromosome $region\n";
+				
+				if (  lc($c->{VARIANTEFFECTS}) eq 'yes' ){
+				    system("/opt/sge/bin/linux-x64/qsub $sgeMainSettings -q short -l cog_bioinf_mysql=1 -o $workdir/reads -e $workdir/reads -N p$cfn\_" . $project . " $workdir/reads/var_$cfn.sh");
+				}else{
+				    system("/opt/sge/bin/linux-x64/qsub $sgeMainSettings -q short -o $workdir/reads -e $workdir/reads -N p$cfn\_" . $project . " $workdir/reads/var_$cfn.sh");
+				}
+				
+				
+				
+				push (@jobs_to_wait, "p$cfn\_" . $project);
+				}
+		}
+	}
+
+	open (POST, ">$workdir/reads/postVariantsMerge.sh");
+	print POST "\#!/bin/sh\n\#\$ -S /bin/sh\n\n";
+
+	#print POST ". $sgeScript\n\n";
+	print POST "cd $workdir\n\n";
+
+	print POST "perl $scriptRoot/SAP42_check_variants $confFileName\n";
+	
+	close (POST);
+
+	if (scalar(@jobs_to_wait) > 0){
+		system("/opt/sge/bin/linux-x64/qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N VAP42merge -sync n -hold_jid " . join(",",@jobs_to_wait) . " $workdir/reads/postVariantsMerge.sh");
+	}else{
+		system("/opt/sge/bin/linux-x64/qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N VAP42merge $workdir/reads/postVariantsMerge.sh");
+	}
+
+	close(QSUB);
+
+}
+# system("sh pileupQsub.sh"); # incase of collect first and fire later
+
+sub getNumber {
+	my $file = shift;
+
+	my $number = `grep -cvP '^#' $file`;
+	chomp $number;
+
+	return $number;
+}
+
+sub check_running_jobs_on_cluster{
+	my $jobs = `qstat -u '*' | wc -l`;
+	chomp($jobs);
+	return $jobs;
+}

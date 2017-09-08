@@ -1,0 +1,618 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+my $projectLocation;
+my $scriptRoot;
+my $pathSubstitute;
+
+$| = 1;
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+}
+
+use Getopt::Long;
+use Getopt::Long qw(GetOptionsFromArray);
+use Number::Format;
+use Cwd;
+require config;
+
+my $configurationFile = shift(@ARGV) or die "Supply a configurationfile\n\n";
+
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+my %firstLine;
+my @to_remove = ();
+my %total;
+my %summary;
+my %statistics;
+
+my $rc 			= 'yes';
+my $cl			= 5;
+my $ind_start_sites	= 3;
+my $rlq			= 'yes';
+my $coverage_limit 	= 20;
+my $q_level		= 10;
+my $det_limit 		= 3; 	#only calls appearing more than this are used
+my $str_bal 		= 0.1;	#strand balance percentage, remove SNP if calls are preferentially from one strand only
+my $inf_cov 		= 0;
+my $seed_sup		= 0; # number of calls that need to be present in seeds (usually 25 bp, check mapping settings)
+my $help		= 0;
+my $pnr			= 20;
+my $pr			= 0;
+my $hom			= 75;
+my $max_cov		= 2000;
+my $mna			= 4;
+my $csnps		= 'yes';
+my $cindels		= 'yes';
+my $ouc			= 'no';
+my $muc			= 1;
+my $verbose		= 0;
+
+my %param;
+
+my $projectname = '';
+my $working_directory = '';
+my $GENOME = '';
+my $variantSettings = '';
+
+foreach my $configuration (@{$configurations}){
+
+	my %checked;
+	my %exists;
+
+	$working_directory = $configuration->{PWD};
+	$projectname = $configuration->{NAME};
+
+	$GENOME = $configuration->{REFERENCE};
+	my $arguments = $configuration->{ALNARG};
+
+	$variantSettings = $configuration->{VARIANTSETTINGS};
+
+	my @varArray = split(' ',$variantSettings);
+
+	my $result = GetOptionsFromArray(\@varArray, "rc=s" => \$rc, "q=i"=>\$q_level, "ss=i"=>\$ind_start_sites, "c=i"=>\$coverage_limit, "mc=i"=>\$max_cov, "d=i"=>\$det_limit, "cl=i"=>\$cl, "rlq=s"=>\$rlq, "seed=i"=>\$seed_sup, "hom=i"=>\$hom,
+			"pnr=i"=>\$pnr,"pr=i"=>\$pr, "sb=f"=>\$str_bal, "mac=i"=> \$mna, "snps=s"=>\$csnps, "indels=s"=>\$cindels, "ouc=s"=>\$ouc,"h!"=>\$help, "-help!"=>\$help, "-verbose!"=>\$verbose);
+
+	$param{ss} = $ind_start_sites;
+	$param{pnr} = $pnr;
+	$param{sb} = $str_bal;
+	$param{d} = $det_limit;
+	$param{seed} = $seed_sup;
+
+	chdir($working_directory);
+
+	my $breakpoint = 0;
+
+	my $brs = '';
+	if (-e "$GENOME.brps"){
+		$breakpoint = 1;
+		$brs = ".brps";
+	}
+
+	print "opening " . $GENOME . "$brs\n";
+	open (FASTA, $GENOME . $brs);
+
+	my $date = `date +'%Y%m%d%H%M'`;
+	chomp($date);
+
+	my $snpFile = $projectname . "_$date.refiltered_snps";
+	my $indelFile = $projectname . "_$date.refiltered_indels";
+	my $fillinFile = $projectname . "_$date.refiltered_fillins";
+	my $referneceFile = $projectname . "_$date.refiltered_reference";
+	my $snpssvn1File = $projectname . "_$date.snvs.snv1";
+	my $snpssvn2File = $projectname . "_$date.snvs.snv2";
+	my $indelssvn1File = $projectname . "_$date.indels.snv1";
+	my $indelssvn2File = $projectname . "_$date.indels.snv2";
+
+	while (<FASTA>){
+		chomp;
+	
+		my $chr = '';
+	
+		if ($_ =~ m/^>(.+)$/){
+			$chr = $1;
+			$chr =~ s/\s.+$//;
+	
+			my $chromosome = $chr;
+			
+			$chr =~ s/[\s:\-\[\]]/_/gi;
+	
+			my @breakpoints = ();
+	
+			if ($breakpoint){
+				my $line = <FASTA>;
+				chomp($line);
+				@breakpoints = split("\t", $line);
+			}
+	
+			shift(@breakpoints);
+	
+			my @regions = ();
+	
+			my $prefReg = 1;
+			foreach my $break (@breakpoints){
+				push(@regions, $chromosome . ':' . $prefReg . '-' . $break);
+				$prefReg = $break-1;
+			}
+	
+			if (!scalar(@regions)){
+				push(@regions, $chromosome);
+			}
+			
+			foreach my $region (@regions){
+				print "checking $region \n";
+	
+				my $cfn = "chr$region";
+				$cfn =~ s/[\s:\-\[\]]/_/gi;
+
+				if (defined($configuration->{CALLSNPS}) && (lc($configuration->{CALLSNPS}) eq 'yes')){
+					$exists{snps}{$cfn} = 0;
+					if (-e "results/$cfn.refiltered_snps"){
+						$exists{snps}{$cfn} = 1;
+						$checked{snps}{$cfn} = check_part("results/$cfn.refiltered_snps", $snpFile, 'snps');
+					}
+				}
+
+				if (defined($configuration->{CALLINDELS}) && (lc($configuration->{CALLINDELS}) eq 'yes')){
+					$exists{indels}{$cfn} = 0;
+					if (-e "results/$cfn.refiltered_indels"){
+						$exists{indels}{$cfn} = 1;
+						$checked{indels}{$cfn} = check_part("results/$cfn.refiltered_indels", $indelFile, 'indels');
+					}
+				}
+
+				if (defined($configuration->{CALLSNPS}) && (lc($configuration->{CALLSNPS}) eq 'yes')){
+					$exists{fillins}{$cfn} = 0;
+					if (-e "results/$cfn.refiltered_fillins"){
+						$exists{fillins}{$cfn} = 1;
+						$checked{fillins}{$cfn} = check_part("results/$cfn.refiltered_fillins", $fillinFile, 'fillins');
+					}
+				}
+
+				if ($pr > 0){
+					$exists{reference}{$cfn} = 0;
+					if (-e "results/$cfn.refiltered_reference"){
+						$exists{reference}{$cfn} = 1;
+						$checked{reference}{$cfn} = check_part("results/$cfn.refiltered_reference", $referneceFile, 'reference');
+					}
+				}
+
+				if (defined($configuration->{VARIANTEFFECTS}) && (lc($configuration->{VARIANTEFFECTS}) eq 'yes')){
+
+					$exists{snps_snv1}{$cfn} = 0;
+					if (-e "results/$cfn.snvs.snv1"){
+						$exists{snps_snv1}{$cfn} = 1;
+						$checked{snps_snv1}{$cfn} = check_part("results/$cfn.snvs.snv1", $snpssvn1File, 'snps_snv1');
+					}
+
+					$exists{snps_snv2}{$cfn} = 0;
+					if (-e "results/$cfn.snvs.snv2"){
+						$exists{snps_snv2}{$cfn} = 1;
+						$checked{snps_snv2}{$cfn} = check_part("results/$cfn.snvs.snv2", $snpssvn2File, 'snps_snv2');
+					}
+
+					$exists{indels_snv1}{$cfn} = 0;
+					if (-e "results/$cfn.indels.snv1"){
+						$exists{indels_snv1}{$cfn} = 1;
+						$checked{indels_snv1}{$cfn} = check_part("results/$cfn.indels.snv1", $indelssvn1File, 'indels_snv1');
+					}
+
+					$exists{indels_snv2}{$cfn} = 0;
+					if (-e "results/$cfn.indels.snv2"){
+						$exists{indels_snv2}{$cfn} = 1;
+						$checked{indels_snv2}{$cfn} = check_part("results/$cfn.indels.snv2", $indelssvn2File, 'indels_snv2');
+					}
+				}
+
+				if (-e "results/$cfn.refiltered_summary"){
+					$exists{summary}{$cfn} = 1;
+					merge_summary("results/$cfn.refiltered_summary");
+				}
+
+				if (defined($configuration->{PILEUP}) && (lc($configuration->{PILEUP}) eq 'no')){ #(lc($configuration->{VARIANTEFFECTS}) eq 'no')){ what had this to do with the cleaning of pileups?
+				#if (-e "results/$cfn.pileup"){
+				    print "should remove pileup...\n";
+					push(@to_remove, "results/$cfn.pileup");
+				}
+			}
+		}
+	}
+
+	print_summary("summary.txt");
+	calculate_statistics($projectname);
+
+# 	use Data::Dumper;
+# 	print Dumper(\%summary) . "\n";
+
+	open (LOG, ">vap42.txt");
+	my $bad = 0;
+	my %cfn_hash;
+	my %cfn_hash2;
+	foreach my $type (keys(%exists)){
+		foreach my $cfn (keys(%{$exists{$type}})){
+
+			if ($exists{$type}{$cfn}){
+				#file exists!
+				if (defined($checked{$type}{$cfn})){
+					if ($checked{$type}{$cfn}){
+						# all good!
+						next;
+					}else{
+						print LOG "$cfn.$type\tBad file\n";
+						next;
+					}
+				}else{
+					#print LOG "$cfn.$type\tTerrible file\n";
+					#$bad++;
+				}
+			}else{
+				print LOG "$cfn.$type\tFile does not exists\n";
+				$cfn_hash{$cfn} = 1;
+				$cfn_hash2{"redo_$cfn"} = 1;
+				$bad++;
+			}
+		}
+	}
+	
+	close (LOG);
+	
+	# check missing parts and create new submission script for the missing parts only, followed by a new merger/checker job.
+	open (CFN, ">redo_vap.sh");
+	print CFN "#!/bin/sh\n\n";
+	my $pwd = cwd();
+	
+	foreach my $cfn_sub (keys %cfn_hash){
+		print CFN "qsub -l h_rt=2:0:0 -l h_vmem=10G -o $pwd//qsub.out -e $pwd//qsub.err -N redo_$cfn_sub reads/var_$cfn_sub.sh\n";
+	}
+	my $cfn_size = scalar keys %cfn_hash;
+	if ( $cfn_size > 0 ){
+		print CFN "qsub -l h_rt=2:0:0 -l mem_free=10G -l h_vmem=10G -o $pwd//qsub.out -e $pwd//qsub.err -N redo_VariantsMerge -sync n -hold_jid " . join(",", (keys %cfn_hash2) ) . " reads/postVariantsMerge.sh\n";
+	}
+	close (CFN);
+	if (not $bad){
+		open (ERR, ">vap42.err");
+	
+		foreach my $file (@to_remove){
+			system("rm $file");
+			print ERR $file, "\n";
+		}
+		close (ERR);
+	}
+
+	open (REPORT, ">vap42.report");
+	
+	my $message = "These number of variants have been found:\n";
+	foreach my $type (keys(%total)){
+		$message .= uc($type) . "\t" . $total{$type} . "\n";
+	}
+
+	if (not $bad){
+		$message .= "\nAll files are correct";
+	}else{
+		$message .= "\nSome $bad files are not correct\nDetails can be found in the attachment\n";
+
+		system("rm $snpFile");
+		system("rm $indelFile");
+		system("rm $fillinFile");
+		system("rm $referneceFile");
+		system("rm $snpssvn1File");
+		system("rm $snpssvn2File");
+		system("rm $indelssvn1File");
+		system("rm $indelssvn2File");
+	}
+
+	print REPORT $message;
+
+	close (REPORT);
+
+	if (not $bad){
+		foreach my $emailAdress (split(',', $configuration->{EMAIL})){
+			system("perl $scriptRoot/SAP42_email -to $emailAdress -subject 'Finished: Calling SNPS for $projectname' -file summary.txt -attachment $projectname\_variant_statistics.pdf");
+		}
+	}else{
+		foreach my $emailAdress (split(',', $configuration->{EMAIL})){
+			system("perl $scriptRoot/SAP42_email -to $emailAdress -subject 'Failed: Calling SNPS for $projectname' -file vap42.report -attachment vap42.txt");
+		}
+	}
+	
+
+}
+
+sub merge_summary{
+	my $f = shift;
+	open(SUM, "<$f");
+
+	print $f . "\n";
+
+	while (<SUM>){
+		chomp;
+		my @line = split("\t");
+		next if scalar(@line) < 2;
+
+		if($line[1] =~ m/^\d+$/){
+			$summary{$line[0]} += $line[1];
+		}elsif(scalar(@line) == 3){
+			
+			foreach my $stat (split(',',$line[2])){
+
+				if ($stat =~ m/(.+)\^(.+)/){
+
+					foreach (1..$2){
+# 						print $1 . "\n" if (($line[1] eq 'sb') && ($1 == 0));
+						$statistics{$line[0]}{$line[1]}{$1}++;
+					}
+
+				}
+			}
+
+		}elsif(scalar(@line) == 4){
+
+			$statistics{count}{$line[1]}{$line[2]} = $line[3];
+		}
+	}
+
+
+	close(SUM);
+}
+
+sub calculate_statistics{
+
+	my $cfn = shift;
+
+	open(R, ">r.tmp");
+
+	my %title;
+	$title{ss} = 'Independent start-sites';
+	$title{pnr} = 'Percentage non-reference';
+	$title{sb} = 'Strand Balance';
+	$title{d} = 'Noise level';
+	$title{seed} = 'Seed support';
+
+	print R "pdf('$cfn\_variant_statistics.pdf', paper='a4', width=0, height=0)\n";
+	print R "par(oma = c(0, 0, 10, 0))\n";
+	print R "layout(matrix(c(1,2,3,4,5,5,6,6), 4, 2, byrow = TRUE))\n";
+	print R "color <- topo.colors(6)\n\n";
+
+	foreach my $t ('snps', 'indels', 'fillins', 'reference'){
+
+# 		print R "plot(1)\n";
+
+		next if (not defined($statistics{$t}));
+
+		my $counts = $statistics{count}{$t};
+
+		my @mutants = ();
+		my @freq = ();
+
+		my $c = 1;
+
+		foreach my $k ( sort{ $a cmp $b } keys(%$counts)){
+			push(@mutants, $k);
+			push(@freq   , $counts->{$k});
+		}
+
+			print R 'x <- c(' . join(',',@freq) . ')' . "\n";
+			print R 'x <-as.matrix(x)' . "\n";
+			print R 'rownames(x) <- c("' . join('","',@mutants) . '")' . "\n";
+			print R 'barplot(x[rev(order(x))[1:min(12,length(x))],], horiz=T, las=1,col=color[' . $c . '])' . "\n";
+# 			print R 'barplot(t(x))' . "\n";
+			print R 'title("Ratio")' . "\n";
+			
+			print join(", ", @mutants) . "\n";
+
+		foreach my $p ('sb','ss','seed','d','pnr'){
+
+			$c++;
+
+			if ($p eq 'sb'){
+				my %h = %{$statistics{$t}{$p}};
+				my @counts = ();
+				#create frequency table
+				my @delimiters = ();
+
+				my @a = sort{ $a <=> $b } keys(%h);
+
+				for (my $f = 0; $f < 1; $f += 0.01){
+
+					if (defined($h{$f})){
+						push (@counts, $h{$f});
+						push (@delimiters, $f);
+					}else{
+						push (@counts, 0);
+						push (@delimiters, $f);
+					}
+				}
+
+				my $cutoff = $param{$p}*100;
+
+				print R 'x <- c(' . join(',',@counts) . ')' . "\n";
+				print R 'x <-as.matrix(x)' . "\n";
+				print R 'rownames(x) <- c(' . join(',',@delimiters) . ')' . "\n";
+# 				print R 'x <- table(factor(x, levels=0:' . $a[-1] . '))' . "\n";
+				print R 'plot <- barplot(t(x),col=color[' . $c . '])' . "\n";
+				print R 'title("' . $title{$p} . '")' . "\n";
+				if ($cutoff){
+					print R 'abline(v=((plot[' . $cutoff . '] + plot[' . ($cutoff + 1) . '])/2), col="red")' . "\n";
+				}
+			}else{
+
+				my %h = %{$statistics{$t}{$p}};
+				my @counts = ();
+				#create frequency table
+
+				my @a = sort{ $a <=> $b } keys(%h);
+
+				foreach my $f (0..$a[-1]){
+					if (defined($h{$f})){
+						push (@counts, $h{$f});
+					}else{
+						push (@counts, 0);
+					}
+				}
+
+				my $cutoff = $param{$p} + 1;
+
+				print R 'x <- c(' . join(',',@counts) . ')' . "\n";
+				print R 'x <-as.matrix(x)' . "\n";
+				if ($p ne 'pnr'){
+					print R 'rownames(x) <- c(' . join(',',(0..$a[-1])) . ')' . "\n";
+				}else{
+					print R 'rownames(x) <- c(' . join(',',(0..100)) . ')' . "\n";
+				}
+# 				print R 'x <- table(factor(x, levels=0:' . $a[-1] . '))' . "\n";
+				print R 'plot <- barplot(t(x),col=color[' . $c . '])' . "\n";
+				print R 'title("' . $title{$p} . '")' . "\n";
+
+				if ($cutoff){
+					print R 'abline(v=((plot[' . $cutoff . '] + plot[' . ($cutoff + 1) . '])/2), col="red")' . "\n";
+				}
+			}
+		}
+
+		my $uct = uc($t);
+
+		my $gen = $GENOME;
+		$gen =~ s/^.+\///;
+
+		print R "mtext(\"$uct statistics\", side=3, outer=TRUE, line=7, cex=2)\n";
+		print R "mtext(\"Project: $projectname\", side=3, outer=TRUE, line=5.5, cex=1)\n";
+		print R "mtext(\"Directory: $working_directory\", side=3, outer=TRUE, line=4, cex=1)\n";
+		print R "mtext(\"Reference: $gen\", side=3, outer=TRUE, line=2.5, cex=1)\n";
+		print R "mtext(\"Total: " . $total{$t} . "\", side=3, outer=TRUE, line=1, cex=1)\n";
+		print R "mtext(\"Used settings: $variantSettings\", side=3, outer=TRUE, line=-0.5, cex=0.5)\n";
+	}
+
+	print R 'dev.off()' . "\n";
+
+	system("/usr/bin/Rscript r.tmp");
+# 	system("rm r.tmp");
+}
+
+sub print_summary{
+	my $f = shift;
+	open(SUM, ">$f");
+
+	use Data::Dumper;
+	print Dumper(\%summary) . "\n";
+
+	$total{snps} = $summary{SNPs} . " (" . fn(percentage($summary{Total}, $summary{SNPs}),2) . "%)";
+	$total{indels} = $summary{Indels} . " (" . fn(percentage($summary{Total}, $summary{Indels}),2) . "%)";
+	$total{fillins} = $summary{Fillins} . " (" . fn(percentage($summary{Total}, $summary{Fillins}),2) . "%)";
+	$total{reference} = $summary{Ref} . " (" . fn(percentage($summary{Total}, $summary{Ref}),2) . "%)" if exists($summary{Ref});
+	
+
+	foreach my $p ('Total',"\n",'SNPs%t','Indels%t','Fillins%t','Failed%t',"\n",'Scooper','mc','c','mac',"\n",'Call filtering','ouc',"\n",'Allele Selection','sb','d','pnr'){
+		print_if_exists($p);
+	}
+
+	sub print_if_exists {
+		my $s = shift;
+
+		if ($s =~ m/\n/){
+			print SUM "\n";
+			return;
+		}
+
+		if ($s =~ m/%t/){
+
+			$s =~ s/%t//;
+
+			if (defined($summary{$s})){
+				print SUM $s . "\t" . $summary{$s} . "\t" . fn(percentage($summary{$s}, $summary{Total}),2) . "%\n";
+			}
+		}elsif ($s =~ m/%s/){
+
+			$s =~ s/%s//;
+
+			if (defined($summary{$s})){
+				print SUM $s . "\t" . $summary{$s} . "\t" . percentage($summary{$s}, $summary{SNPs}) . "\n";
+			}
+
+		}else{
+			if (defined($summary{$s})){
+				print SUM $s . "\t" . $summary{$s} . "\n";
+			}else{
+				print SUM $s . "\n";
+			}
+		}
+
+
+	}
+}
+
+sub percentage {
+	@_ = sort{$a <=> $b}@_;
+
+	return 0 if $_[1] == 0;
+
+	return ((100 / $_[1]) * $_[0]);
+}
+
+sub fn {
+	my $n = shift;
+	my $r = 2;
+	if (scalar(@_)){
+		$r = shift;
+	}
+	return Number::Format::round($n, $r);
+}
+
+sub check_part {
+	my $fn = shift; #filename
+	my $mf = shift;
+	my $t = shift;
+	open (IN, $fn) or return 0;
+	open (OUT, ">>$mf") or return 0;
+# 	my $firstLine = <IN>;
+	my $end_found = 0;
+
+	while (<IN>){
+		chomp;
+		if ($_ =~ m/^#/){
+
+			if (not defined($firstLine{$mf})){
+				chomp($_);
+				print OUT $_ , "\n";
+			}
+
+
+
+			if($_ =~ m/end/i){
+				$firstLine{$mf} = 1;
+				$end_found = 1;
+			}
+
+		}else{
+
+			$firstLine{$mf} = 1;
+
+			$total{$t}++;
+			print OUT $_ , "\n";
+		}
+		
+	}
+
+	close(IN);
+	close(OUT);
+
+	if ($end_found){
+		push(@to_remove, $fn);
+		return 1;
+	}
+	return 0;
+}

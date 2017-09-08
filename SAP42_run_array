@@ -1,0 +1,351 @@
+#!/usr/bin/perl -w
+
+use strict;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $sgeMainSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $samtools;
+my $bwa;
+use POSIX qw(tmpnam);
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+	$sgeMainSettings = $settings->{SGEMAINSETTINGS};
+	$samtools = $settings->{SAMTOOLS};
+	$bwa = $settings->{BWA};
+	if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+}
+
+# 
+# die;
+require config;
+my $configurationFile = shift(@ARGV) or die "Supply a configurationfile\n\n";
+my $runInBackground = 0;
+
+# if (my $background = shift(@ARGV)){
+# 	if ($background eq 'background'){
+# 		$runInBackground = 1;
+# 	}
+# }
+# 
+# if (!$runInBackground){
+# 	system("$scriptRoot/SAP42_run $configurationFile background &");
+# 	die "Starting to run in background\n";
+# 	
+# }
+
+# my $configuration = '';
+# my $working_directory = '';
+# my $projectname = '';
+
+my ($configurations, $n_configs) = config::loadConfiguration($configurationFile);
+
+foreach my $configuration (@{$configurations}){
+
+	my $working_directory = $configuration->{PWD};
+	my $projectname = $configuration->{NAME};
+	
+	my $GENOME = $configuration->{REFERENCE};
+	my $arguments = $configuration->{ALNARG};
+
+	chdir($working_directory);
+
+	#STATISTICS
+
+	if ($configuration->{PRESTATS}){
+
+		print "perl $scriptRoot/SAP42_statistics --pre $configurationFile\n\n";
+		system("perl $scriptRoot/SAP42_statistics --pre $configurationFile &");
+	}
+
+	my $email = $configuration->{EMAIL};
+	
+	# print "perl $scriptRoot/SAP42_email -to f.ruzius\@hubrecht.eu -subject 'testing done' -file $configurationFile\n > test";
+
+	# my $GENOME = '/home/fedor/GENOMES/human_GRCh37/GRCh37_core.fasta';
+	#my $GENOME = "/home/fedor/GENOMES/human_ncbi36/edwin_nonref.csbfa";
+	#my $GENOME = "/home/fedor/GENOMES/human_ncbi36/h1";
+	
+	#my $fedors2run = 6;
+	#my $startwith = 1;
+
+	chdir($working_directory);
+
+	my @to_run;
+	while (my $f=<reads/*p*.fastq>) {
+	$f=~s/reads\///;
+	push @to_run, $f;
+	}
+	
+	my $workdir = $working_directory; $workdir=~s/\n//;
+	if (defined($pathSubstitute)){
+		foreach my $path (keys %{$pathSubstitute}){
+			if ($workdir =~ m/^$path/){
+				my $substitute = $pathSubstitute->{$path};
+				$workdir =~ s/$path/$substitute/;
+				last;
+			}
+		}
+	}
+	
+	open QSUB,">qsub2.sh";
+	print QSUB "\#!/bin/sh\n\n";#. $sgeScript\n\n";
+	
+	mkdir "results" unless -e "results";
+	
+	my @jobs_to_wait;
+	foreach my $p (@to_run) {
+		
+		print "$p\n";
+	
+		my $doList = 0;
+	
+		my $coreName = $p;
+		$coreName =~ s/\.fastq//;
+	
+		my $sam = "$coreName.sam";
+	
+	
+		my $randomID = get_job_id();
+	
+		my $job_id = "BWA$p".$randomID;
+	
+		warn "submitting $p\n";
+	
+		my $tmpFolder = "/tmp/$projectname\_$coreName\_$randomID";
+	
+	# 	my $nreads = `grep -c '>' reads/$p`;
+	# 	$nreads=~s/\s//g;    
+		open SH,">reads/$job_id.sh";
+		print SH "\#!/bin/sh\n\#\$ -S /bin/sh\n\n";
+		#    my $p2 = $p;
+		#    $p2 =~ s/\.read1\.bfq$/\.read2\.bfq/;
+		#    print SH "cp $workdir/reads/$p2 ./\n";
+	
+		#print SH "sleep " . int(rand(20)) . "\n\n\n\n";
+	
+		print SH "cd $workdir\n\n";
+		print SH "uname -n > results/$p.host\n";
+		print SH "date >> results/$p.host\n";
+		
+		print SH "uname -n > results/$p.err\n";
+	
+		#print SH "mkdir $tmpFolder \n\n";
+	
+		my $bam = "$coreName.bam";
+
+
+		if (!-e "results/$coreName\_sorted.bam"){
+		
+			$doList++;
+			print "alignment\n";
+	
+			print SH "echo -e \"\\nBWA mapping\" >> results/$p.err\n\n";
+	
+			print SH "$bwa aln $arguments $GENOME reads/$p > results/$p.out 2>> results/$p.err\n\n";
+	
+			print SH "date >> results/$p.host\n\n";
+	
+			print SH "echo -e \"\\nSAM\" >> results/$p.err\n\n";
+	
+			print SH "$bwa samse $GENOME results/$p.out reads/$p > results/$sam 2>> results/$p.err\n\n";
+	
+	
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";
+		
+		
+			#print SH "cp $tmpFolder/$sam results/\n\n";
+			#Do not copy SAM, becouse it uses space
+	
+		}else{
+			#print SH "cp results/$sam $tmpFolder/\n\n";
+		}
+	
+		if (!-e "results/$coreName\_sorted.bam"){
+	
+			$doList++;
+			print "Convert to bam\n";
+			print SH "echo -e \"\\nSAM 2 BAM\" >> results/$p.err\n\n";
+	
+			my $cmd = join( ' ', $samtools,
+						'import',
+						"$GENOME.fai",
+						"results/$sam",
+						"results/$bam",
+			);
+	
+			print SH $cmd . " 2>> results/$p.err\n\n";
+	
+	
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";
+	
+			#print SH "cp $tmpFolder/$bam results/ 2>> results/$p.err\n\n";
+			# no copy, uses space.
+	
+	
+		}else{
+	
+			#print SH "cp results/$bam $tmpFolder/ 2>> results/$p.err\n\n";
+		}
+	
+		if (!-e "results/$coreName\_sorted.bam"){
+	
+			$doList++;
+			print "Sort bam\n";
+			print SH "echo -e \"\\nSort BAM\" >> results/$p.err\n\n";
+	
+			my $cmd = join( ' ', $samtools,
+						'sort',
+						"results/$bam",
+						"results/$coreName\_sorted",
+			);
+			print SH $cmd . " 2>> results/$p.err\n\n";
+
+			print SH "echo -e \"\\nCOPY AND REMOVE\" >> results/$p.err\n\n";
+			#print SH "ls -la $tmpFolder/ >> results/$p.err\n\n";
+			
+		
+			#print SH "cp $tmpFolder/$coreName\_sorted.bam results/ 2>> results/$p.err\n\n";
+	
+		}
+	
+		#print SH "rm -rf $tmpFolder/ 2>> results/$p.err\n\n";
+	
+		print SH "date >> results/$p.host\n";
+	
+		close SH;
+	
+	
+		if ($doList < 1){
+			warn "Skipping $p\n";
+			next;
+		}
+	
+	
+	#    my ($hostname) = $p =~ m/part(\d+)/;
+	#    $hostname = $startwith + $hostname % $fedors2run;
+	#    $hostname = 'fedor'.$hostname;
+	print QSUB "qsub $sgeSettings -o $workdir/qsub.out -e $workdir/qsub.err -N $job_id $workdir/reads/$job_id.sh\n";
+	print QSUB "\n";
+	#    print QSUB "qsub -p 200 -l hostname=$hostname -o $workdir/reads -e $workdir/reads -N $job_id $workdir/reads/$job_id.sh\n";
+	push @jobs_to_wait, $job_id;
+	#    last;
+	}
+	
+	my $postAnalysis = "";
+	my $postStatsist = "";
+	my $postVariants = "";
+
+	#$postAnalysis .= "mkdir /tmp/$projectname/\n\n";
+	$postAnalysis .= "perl $scriptRoot/post_merge_bams.pl $projectname\n\n";
+	#$postAnalysis .= "cp /tmp/$projectname/$projectname.bam ./\n\n";
+	#$postAnalysis .= "perl $scriptRoot/post_index_bam.pl $projectname.bam\n";
+	# $postAnalysis .= "cp /tmp/$projectname/$projectname.pileup ./\n\n";
+	#$postAnalysis .= "rm -rf /tmp/$projectname/\n";
+# 	$postAnalysis .= "perl $scriptRoot/checkMappabillityBam.pl $projectname.bam $projectname\n\n";
+
+	if ($configuration->{POSTSTATS}){
+		print "perl $scriptRoot/SAP42_statistics --post $configurationFile\n\n";
+
+		#$postStatsist .=  "sleep 60\n\n";
+
+		$postStatsist .=  "perl $scriptRoot/SAP42_statistics --post $configurationFile \n\n";
+	}
+
+	if (defined($configuration->{VARIANTSETTINGS})){
+		print "perl $scriptRoot/SAP42_run_variants $configurationFile\n\n";
+		$postVariants .=  "perl $scriptRoot/SAP42_run_variants $configurationFile\n\n";
+	}
+
+	$postAnalysis .= "perl $scriptRoot/SAP42_check -remove-fastq -cleanup > $workdir/remove.log\n\n";
+	
+	runCommand("postAnalysis",$postAnalysis, $workdir);
+	runCommand("postStatsist",$postStatsist, $workdir);
+	runCommand("postVariants",$postVariants, $workdir);
+	
+	print "\nNumber of jobs submitted: ",scalar(@jobs_to_wait),"\n\n";
+	
+	my $post_analysis_job_id = "postAnalysis" . get_job_id();
+
+	if (scalar(@jobs_to_wait) > 0){
+		#sleep(2);
+		print QSUB "qsub $sgeSettings -l hostname=hpcn001 -o $workdir/qsub.out -e $workdir/qsub.err -N $post_analysis_job_id -sync y -hold_jid " . join(",",@jobs_to_wait) . " $workdir/postAnalysis.sh &\n\n";
+
+	}else{
+		#sleep(2);
+		print QSUB "qsub $sgeSettings -l hostname=hpcn001 -o $workdir/qsub.out -e $workdir/qsub.err -N postAnalysis $workdir/postAnalysis.sh &\n\n";
+	}
+	
+	push @jobs_to_wait, "$post_analysis_job_id";
+	
+	
+	my $clusterJobName = $workdir;
+	#$clusterJobName =~ s/data//;
+	#$clusterJobName =~ s/\//_/g;
+	#$clusterJobName =~ s/^.+fedor23//;
+	
+	# open SH, ">reads/dummy.sh";
+	# print SH "\#!/bin/sh\n\n";
+	# print SH "echo \"Job finished\" > $clusterDir/$clusterJobName\n";
+	# close SH;
+	
+	# print QSUB "qsub -sync y -hold_jid ",join(",",@jobs_to_wait)," $workdir/reads/dummy.sh &\n\n";
+	close QSUB;
+	
+	system("sh $workdir/qsub2.sh");
+	
+# 	foreach my $emailAdress (split(',', $email)){
+# 	
+#  		system("perl $scriptRoot/SAP42_email -to $emailAdress -subject 'Mapping $projectname finished' -file $configurationFile");
+# 	
+# 	}
+
+}
+
+#`cat parts/*.parsed >groups.perfect.02`;
+#`rm parts/*.e*`;
+#`rm parts/*.o*`;
+#`rm parts/*.sh*`;
+
+############
+sub get_job_id {
+   my $id = tmpnam(); 
+      $id=~s/\/tmp\/file//;
+   return $id;
+}
+
+############
+  
+sub runCommand {
+
+	my ($name, $command, $workdir) = @_;
+
+	open SH,">$name.sh";
+	print SH "\#!/bin/sh\n\#\$ -S /bin/sh\n\n";
+
+	print SH "\#!/bin/sh\n\n";# . $sgeScript\n\n";
+
+	print SH "cd $workdir\n\n";
+
+	print SH "$command\n\n";
+
+	close (SH);
+}

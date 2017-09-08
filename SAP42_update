@@ -1,0 +1,376 @@
+#!/usr/bin/perl
+use strict;
+
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $webroot;
+my $dataroot;
+my $rawdataroot;
+my $datasuffix;
+my $referenceroot;
+my $webnode;
+my $submitnode;
+my $h5dump;
+use POSIX qw(tmpnam);
+
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$webroot = $settings->{WEBROOT};
+	$dataroot = $settings->{DATAROOT};
+	$rawdataroot = $settings->{RAWDATAROOT};
+	$datasuffix = $settings->{DATASUFFIX};
+	$referenceroot = $settings->{REFERENCEROOT};
+	$webnode = $settings->{WEBNODE};
+	$submitnode = $settings->{SUBMITNODE};
+	$h5dump = $settings->{PERLMODULES}.'/XSQConverter/h5dump';
+
+}
+
+print "starting...\n\n";
+
+my $xsq_files;
+my $fq_files;
+
+my %reference_files;
+my %run_type;
+
+my $c = 0;
+
+umask 0002; #set files to 775
+
+update_bam_files();
+update_solid_data();
+#update_references();
+#update_illumina_data();
+
+
+my $currentNode = `uname -n`;
+chomp($currentNode);
+
+if ($currentNode eq $webnode){
+	if (-e $webroot){
+		system("cp $scriptRoot/references.sap42.list $webroot/reference.txt");
+	}
+	
+	if (-e $webroot){
+		system("cp $scriptRoot/data.sap42.list $webroot/data.txt");
+		system("cp $scriptRoot/data5500.sap42.list $webroot/data5500.txt");
+		system("cp $scriptRoot/dataXSQ.sap42.list $webroot/dataXSQ.txt");
+		system("cp $scriptRoot/dataFQ.sap42.list $webroot/dataFQ.txt");
+	}
+	
+	if (-e $webroot){
+		system("cp $scriptRoot/bam.sap42.html $webroot/bam.html");
+		print "cp $scriptRoot/bam.sap42.html $webroot/bam.html\n";
+	}
+
+}else{
+	#webnode is a different machine
+	print "Copying to $webnode\nYou can be prompted for password\n\n";
+
+	system("cp $scriptRoot/references.sap42.list $scriptRoot/tmp/reference.txt");
+	system("cp $scriptRoot/data.sap42.list $scriptRoot/tmp/data.txt");
+	system("cp $scriptRoot/data5500.sap42.list $scriptRoot/tmp/data5500.txt");
+	system("cp $scriptRoot/dataXSQ.sap42.list $scriptRoot/tmp/dataXSQ.txt");
+	system("cp $scriptRoot/dataFQ.sap42.list $scriptRoot/tmp/dataFQ.txt");
+	system("cp $scriptRoot/bam.sap42.html $scriptRoot/tmp/bam.html");
+
+	print "scp $scriptRoot/tmp/reference.txt $scriptRoot/tmp/data.txt $scriptRoot/tmp/data5500.txt $scriptRoot/tmp/bam.html $scriptRoot/tmp/dataXSQ.txt $scriptRoot/tmp/dataFQ.txt $webnode:$webroot/\n";
+	system("scp -p $scriptRoot/tmp/reference.txt $scriptRoot/tmp/data.txt $scriptRoot/tmp/data5500.txt $scriptRoot/tmp/bam.html $scriptRoot/tmp/dataXSQ.txt $scriptRoot/tmp/dataFQ.txt $webnode:$webroot/");
+}
+
+
+umask 0022; #returns to normal 755 mode
+
+sub update_references {
+	print "Updating references...\n";
+	my $data_on_fedor8 = `find $referenceroot/ -name *.nt.pac`;
+	my @files_on_fedor8 = split("\n", $data_on_fedor8);
+	filterPaths_reference(@files_on_fedor8);
+	printReferences();
+}
+
+sub update_bam_files {
+	print "Updating BAM files...\n";
+	my $data_on_fedor8 = `find -L $dataroot/mapping/diagnostiek/GENEPANELS -name '*.bam' -print`;
+	my @files_on_fedor8 = split("\n", $data_on_fedor8);
+	my $str = filterPaths_bams(@files_on_fedor8);
+	open (HTML, ">$scriptRoot/bam.sap42.html");
+	print HTML join('',to_html($str)) . "\n";
+	close HTML;
+}
+
+sub update_solid_data {
+	# get all files on the SOLiD machine
+	my @xsqs = ();
+	print "Updating SOLiD data (XSQ files)...\n";
+	
+	for my $datafolder (split(',',$rawdataroot)){
+		$datafolder =~ s/\s//g;
+		print "Searching in $datafolder/solid for xsq-files..\n\n";
+		my $xsq_files = `find -L $datafolder/solid -size +0 -name *.xsq ! -name '*CET.xsq' ! -name '*CEST.xsq'`;
+		foreach my $path (split("\n", $xsq_files)){
+			push(@xsqs, $path); 
+		}
+	}
+	filterPaths_xsq(@xsqs);
+	printRunsXSQ();
+}
+
+
+sub update_illumina_data {
+	# get all files on the illumina machine
+	my @fq = ();
+	print "Updating Illumina data...\n";
+	
+	for my $datafolder (split(',',$rawdataroot)){
+		$datafolder =~ s/\s//g;
+		print "Searching in $datafolder for fastq-files..\n\n";
+		my $fq_files = `find -L $datafolder/ -size +0 -name *.fastq.gz -or -name *.fastq -or -name *.fq.gz -or -name *.fq`;
+		foreach my $path (split("\n", $fq_files)){
+			push(@fq, $path); 
+		}
+	}
+	filterPaths_fq(@fq);
+	printRunsFQ();
+	
+	# unzip if necessary?
+	# count reads and store for mapping pipeline?
+	
+}
+
+
+sub filterPaths_fq {
+    foreach my $file (@_) {
+	#/hpc/cog_bioinf/raw_data//miseq/130305_M01102_0008_000000000-A33DU/Data/Intensities/BaseCalls/2-2en1-2_S2_L001_R2_001.fastq.gz
+	#LIV17513D_H7W1KADXX_CAGATC_L002_R2_001.fastq.gz
+	#/hpc/cog_bioinf/raw_data/hiseq/131111_D00267_0032_BH7W1KADXX/Unaligned/Project_WGSliverorganoid/Sample_LIV17513D_H7W1KADXX
+	my $run_name = $1 if($file =~ /\/([\w\d_-]+)\/Unaligned/); #hiseq
+	$run_name = $1 if($file =~ /\/([\w\d_-]+)\/Data/); #miseq
+	my $filename = $1 if ($file =~ /\/([\w\d_-]+)(.fastq|.fastq.gz|.fq|.fq.gz)$/);
+	my ($libname, $segment_name, $tag, $lane) = (split(/_/,$filename))[0,1,2,3];
+	print "$file >> runname: $run_name\tfilename: $filename\tlibname: $libname\tsegment:$segment_name\ttag: $tag\n";
+	$fq_files->{$run_name}->{"$segment_name\_$lane"}->{$libname}->{$tag} = $file;
+    }
+}
+
+
+sub printRunsFQ{
+	my $c = 0;
+	print "Saving to $scriptRoot/dataFQ.sap42.list" . "\n\n";
+	open (OUT,  ">$scriptRoot/dataFQ.sap42.list") or die "$!\n";
+	foreach my $run (sort {$a cmp $b} keys %{$fq_files}){
+		foreach my $segment (sort {$a cmp $b} keys %{$fq_files->{$run}}){
+			foreach my $library (sort {$a cmp $b} keys %{$fq_files->{$run}->{$segment}}){
+				foreach my $tag (sort {$a cmp $b} keys %{$fq_files->{$run}->{$segment}->{$library}}){
+					my $fqfile = $fq_files->{$run}->{$segment}->{$library}->{$tag};
+					print OUT $c, "\t", $run, "\t", $segment, "\t", $library, "\t" ,$fqfile, "\n";
+					$c++;
+				}	
+			}
+		}
+	}
+	close OUT;
+}
+
+
+sub printRunsXSQ{
+	my $c = 0;
+	print "Saving to $scriptRoot/dataXSQ.sap42.list" . "\n\n";
+
+	open (OUT,  ">$scriptRoot/dataXSQ.sap42.list") or die "$!\n";
+	# $xsq_files->{$run_name}->{$libname}->{$tag} = $file;
+	foreach my $run (sort {$a cmp $b} keys %{$xsq_files}){
+		foreach my $segment (sort {$a cmp $b} keys %{$xsq_files->{$run}}){
+			foreach my $library (sort {$a cmp $b} keys %{$xsq_files->{$run}->{$segment}}){
+				foreach my $tag (sort {$a cmp $b} keys %{$xsq_files->{$run}->{$segment}->{$library}}){
+					my $xsqfile = $xsq_files->{$run}->{$segment}->{$library}->{$tag};
+					print OUT $c, "\t", $run, "\t", $segment, "\t", $library, "_", $tag, "\t" ,$xsqfile, "\n";
+					$c++;
+				}	
+			}
+		}
+	}
+	close OUT;
+}
+
+sub filterPaths_xsq {
+	#check if XSQ entry already exists, if so skip creating of contents for file
+	if(-e "$scriptRoot/dataXSQ.sap42.list"){
+		open (XSQS, "<$scriptRoot/dataXSQ.sap42.list") or die "Couldn't open $scriptRoot/dataXSQ.sap42.list\n";
+		while(my $line = <XSQS>){
+			chomp($line);
+			my ($nr, $run_name, $segment_name, $lib, $file) = split("\t", $line);
+			my ($libname, $tag) = split("_",$lib);
+			if(-e $file){
+			    $xsq_files->{$run_name}->{$segment_name}->{$libname}->{$tag} = $file;
+			}
+		}
+		close XSQS;
+	}
+	
+
+	foreach my $file (sort(@_)){
+		my $type;
+		my $run_name = '';
+		my $lib;
+		my $segment_name = 'X';
+
+		print "\n" . $file . "\n";
+		if($file =~ m/\/.*\/(.*?)\/(L\d{2})\/result\/.*\.xsq$/){#wildfire
+			$run_name = $1;
+# 			print $run_name . "\n";
+			$segment_name = $2;
+		}elsif($file =~ m/\/.*\/(.*?)\/result\/(lane\d{1})\/.*\.xsq$/){
+			$run_name = $1;
+# 			print $run_name . "\n";
+			$segment_name = $2;
+		}
+# 		exit;
+		if(exists($xsq_files->{$run_name}->{$segment_name}) or ! $run_name){
+			next; #File is already analyzed for contents
+		}
+
+		open (DUMP, "$h5dump -n $file |");
+		<DUMP>;<DUMP>; #Skip first two lines
+
+		my $first_line = <DUMP>;
+
+		if($first_line =~ m/^\sgroup\s.*?\//){ #Non barcoded
+			$type = 'fragment';
+			if(`$h5dump -a /DefaultLibrary/LibraryName $file` =~ m/\(0\): "(.*)"/){
+				$lib = $1;
+			}
+		}elsif($first_line =~ m/^\sdatatype/){ #Barcoded
+			$type = 'barcoded';
+		}
+
+
+		my $lib_regex = qr/\/(.*)\/\d{4}\/(.*)\/ColorCallQV/;
+		while(my $line = <DUMP>){
+			chomp($line);
+		
+			my $libname = $type eq 'fragment' ? $lib : '';
+			my $tag = '';
+		
+			if($line =~ m/$lib_regex/){
+				$libname = $type eq 'barcoded' ? (split('_', $1))[0] : $lib;
+				$tag = $2;
+				
+				next if($libname eq 'Indexing' or $libname eq 'Unclassified' or $libname eq 'RunMetadata' or $libname eq 'Unassigned') or ! $run_name;
+		
+				
+				$xsq_files->{$run_name}->{$segment_name}->{$libname}->{$tag} = $file;
+			}		
+		}
+		close DUMP;
+	}
+}
+
+
+sub filterPaths_bams {
+	my $tree = {};
+
+	foreach my $bampath (sort(@_)){
+		my @splitPath = split('/', $bampath);
+		my $prefious_subtree = $tree;
+		my $bamfile = pop(@splitPath);
+		foreach my $folder (@splitPath){
+			if (not defined($prefious_subtree->{$folder})){
+				$prefious_subtree->{$folder} = {};
+			}
+			$prefious_subtree = $prefious_subtree->{$folder};
+		}
+		$prefious_subtree->{$bamfile} = $bampath;
+	}
+	return $tree;
+}
+
+sub filterPaths_reference{
+	foreach my $file (@_){
+		
+		my $reference = '';
+		my $basenamename = '';
+		
+		if ($file =~ m/^.+\/(.+?)\/(.+?)\.nt\.pac$/){
+			$reference = $1;
+			$basenamename = $2;
+		}
+		$file =~ s/\.nt\.pac$//;
+
+		if (defined($reference_files{$basenamename}->{$reference})){
+			$reference .= '_2';
+			$basenamename .= 'x';
+		}
+		push(@{$reference_files{$basenamename}->{$reference}}, $file);
+	}
+}
+
+sub printReferences{
+	open (OUT,  ">$scriptRoot/references.sap42.list");
+	my $location = shift;
+	my $c = 0;
+
+	foreach my $run (keys %reference_files){
+		foreach my $library (keys %{$reference_files{$run}}){
+				print OUT $c, "\t", $library, "\t", @{$reference_files{$run}->{$library}}[-1], "\n";
+				$c++;
+		}
+	}
+}
+
+sub to_html {
+	my $hash = shift;
+	my @html = ();
+
+# 	push(@html, "<head>\n");
+# 	push(@html, "<link rel='stylesheet' type='text/css' href='div.css' />\n");
+# 	push(@html, "<script type='text/javascript' src='div.js'></script>\n");
+# 	push(@html, "</head>\n");
+# 	push(@html, "<div class='bam_container' id='bam_container'>\n");
+
+		foreach my $entry (sort(keys(%{$hash}))){
+			my $item = $hash->{$entry};
+			if (substr("$item",0,1) ne "1"){
+				push(@html, "<div class='folderheader' ><div class='folderheadercontainer' ><div class='foldername' onclick='open_or_close_folder(this);'>$entry </div></div>\n");
+				push(@html, "<div class='foldermaster' id='foldermaster'>\n");
+				push(@html, folder_to_div($item));
+				push(@html, "</div>\n");
+				push(@html, "</div>\n");
+			}else{
+				push(@html, "<div class='fileName' id='fileName'> <input type='checkbox' name='bam[ ]' value='$item' /> $entry </div>\n");
+			}
+		}
+
+
+	sub folder_to_div {
+		my @div = ();
+		my $folder = shift;
+
+		foreach my $entry (sort(keys(%{$folder}))){
+			my $item = $folder->{$entry};
+			if (substr("$item",0,1) ne "/"){
+				push(@div, "<div class='folderheader' ><div class='folderheadercontainer' ><div class='foldername' onclick='open_or_close_folder(this);' >$entry </div> <div class='selectall' onclick='expand_all(this);'>expand all</div> <div class='selectall' onclick='select_all(this);'>select all</div></div>\n");
+				push(@div, "<div class='folder' id='folder'>\n");
+				push(@div, folder_to_div($item));
+				push(@div, "</div>\n");
+				push(@div, "</div>\n");
+			}else{
+				push(@div, "<div class='fileName' id='fileName'> <input type='checkbox' name='bam[ ]' value='$item' /> $entry </div>\n");
+			}
+		}
+		return @div;
+	}
+	return @html;
+}
+

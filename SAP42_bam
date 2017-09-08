@@ -1,0 +1,32 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+my $bamfiles = `find /hpc/cog_bioinf/data/mapping -name "*.bam"`;
+chomp($bamfiles);
+
+my %bam;
+
+foreach my $bamfile (split("\n", $bamfiles)){
+
+	next if $bamfile =~ m/remote\.md5$/;
+	next if $bamfile =~ m/bai$/;
+
+	next if $bamfile =~ m/md5$/;
+
+	next if $bamfile =~ m/\/results\//;
+
+	$bamfile =~ s/\.md5$//;
+
+	$bam{$bamfile} = 1;
+}
+
+my $counter = 0;
+
+open (BAM,">bams.txt");
+
+foreach my $bamfile (sort{ $a cmp $b } keys(%bam)){
+	print BAM $counter . "\t" . $bamfile . "\n";
+	$counter++;
+}
+

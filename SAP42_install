@@ -1,0 +1,93 @@
+#!/usr/bin/perl -w 
+
+use strict;
+use Getopt::Std;
+my $projectLocation;
+my $scriptRoot;
+my $sgeSettings;
+my $pathSubstitute;
+my $sgeScript;
+my $tmpFolder;
+my $webnode;
+my $submitnode;
+my $webroot;
+use POSIX qw(tmpnam);
+
+### Required begin code, vital for pipeline function
+BEGIN {
+	$projectLocation = $0;
+	$projectLocation =~ s/[\w\.]+?$//;
+	$projectLocation = './' if $projectLocation !~ /\//;
+	unshift(@INC, $projectLocation) ;
+	require settings;
+	my $settings = settings::loadConfiguration("$projectLocation/sap42.ini");
+	unshift(@INC, $settings->{PERLMODULES});
+	$scriptRoot = $settings->{SCRIPTROOT};
+	$sgeScript = $settings->{SGESCRIPT};
+	$sgeSettings = $settings->{SGESETTINGS};
+		if (defined($settings->{PATH})){
+		my $paths = $settings->{PATH};
+		my ($key, $value) = split(" ", $paths);
+		$pathSubstitute->{$key} = $value;
+	}
+
+	$tmpFolder = $settings->{TMPFOLDER};
+	$webnode = $settings->{WEBNODE};
+	$submitnode = $settings->{SUBMITNODE};
+	$webroot = $settings->{WEBROOT};
+}
+
+if ($webnode eq $submitnode){
+
+	print "Please make sure the webroot $webroot exists\n";
+exit;
+	if (-d $webroot){
+		print "webfolder exists\n";
+
+	}else{
+		system("mkdir $webroot");
+	}
+
+	system("cp -vr $scriptRoot/web/** $webroot 2> /dev/null");
+	system("cp $scriptRoot/sap42.ini $webroot  2> /dev/null");
+
+	print "Data copied.";
+
+	print "Making extra textfiles\n\n";
+
+	foreach my $file ('data5500.tmp.txt', 'data.tmp.txt','reference.ignore.txt','reference.tmp.txt','variantsettings.txt', 'design.txt'){
+		print "\tMaking $file\n";
+
+		if (!-e "$webroot/$file"){
+			system("touch $webroot/$file");
+			system("chmod 666 $webroot/$file");
+		}
+	}
+
+
+}else{
+	print "attemting to copy data to the webnode\n";
+	print "Please make sure the webroot $webroot exists on $webnode\n\n";
+
+	my $succes = system("scp -r $scriptRoot/web/* $webnode:$webroot 2> /dev/null");
+	system("scp $scriptRoot/sap42.ini $webnode:$webroot 2> /dev/null");
+
+	if(not $succes){
+		print "Please copy the contents of $scriptRoot/web to $webnode\n";
+		print "In the folder: $webroot\n";
+	}
+
+	foreach my $file ('data5500.tmp.txt', 'data.tmp.txt','reference.ignore.txt','reference.tmp.txt','variantsettings.txt', 'design.txt'){
+		print "\tMaking $file\n";
+
+		system("ssh $webnode 'touch  $webroot/$file'");
+		system("ssh $webnode 'chmod 666 $webroot/$file'");
+
+	}
+}
+
+system("chmod +x $scriptRoot/SAP42*");
+
+# running update script
+print "Running SAP42 update...\n\n";
+system("perl $scriptRoot/SAP42_update");
